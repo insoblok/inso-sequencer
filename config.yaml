@@ -1,0 +1,28 @@
+sequencer:
+  listen_addr: "0.0.0.0:8545"
+  ws_addr: "0.0.0.0:8546"
+  block_time: 500ms
+  max_block_gas: 30000000
+  max_tx_per_block: 5000
+
+l1:
+  rpc_url: "http://localhost:8551"
+  chain_id: 1
+  batch_inbox_addr: "0x0000000000000000000000000000000000000000"
+  batch_submitter_key: "${BATCH_SUBMITTER_PRIVATE_KEY}"
+  submission_interval: 30s
+
+tastescore:
+  enabled: true
+  api_url: "https://api.insoblokai.io"
+  api_key: "${TASTESCORE_API_KEY}"
+  ordering_weight: 0.3
+  cache_ttl: 60s
+
+logging:
+  level: info
+  format: json
+
+metrics:
+  enabled: true
+  addr: "0.0.0.0:6060"
