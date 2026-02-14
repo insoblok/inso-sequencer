@@ -1,45 +1,41 @@
 package state
 
 import (
-	"crypto/sha256"
 	"math/big"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core"
+	ethState "github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
 
+	"github.com/insoblok/inso-sequencer/internal/execution"
+	"github.com/insoblok/inso-sequencer/internal/genesis"
 	insoTypes "github.com/insoblok/inso-sequencer/pkg/types"
 )
 
-// Manager is the in-memory state manager for the L2 chain.
-// In production, this would be backed by a persistent database (LevelDB / Pebble).
+// Manager is the state manager for the L2 chain, backed by persistent storage.
+// It wraps the EVM executor, state store (Pebble + MPT), and chain database.
 type Manager struct {
 	mu sync.RWMutex
 
-	// Chain state
-	blocks       map[uint64]*insoTypes.L2Block
-	blockHashes  map[common.Hash]uint64
+	// Core components
+	stateStore  *execution.StateStore
+	chainDB     *execution.ChainDB
+	executor    *execution.EVMExecutor
+	chainConfig *params.ChainConfig
+
+	// Current chain tip
 	currentBlock uint64
 	stateRoot    common.Hash
 
-	// Transaction index
-	txIndex      map[common.Hash]*types.Transaction
-	txReceipts   map[common.Hash]*types.Receipt
-	txBlockIndex map[common.Hash]uint64
-
-	// Account state (simplified — balances & nonces)
-	balances map[common.Address]*big.Int
-	nonces   map[common.Address]uint64
-
-	// Batch tracking
-	batches     []*insoTypes.Batch
-	latestBatch *insoTypes.Batch
-
-	// L1 origin
+	// L1 origin tracking
 	l1Origin insoTypes.L1Origin
 
-	// Sequencer status
+	// Sequencer identity
 	isSequencing  bool
 	sequencerAddr common.Address
 	chainID       uint64
@@ -47,51 +43,97 @@ type Manager struct {
 	logger log.Logger
 }
 
-// NewManager creates a new state manager with genesis state.
-func NewManager(chainID uint64, sequencerAddr common.Address) *Manager {
+// NewManager creates a new state manager with persistent storage and EVM execution.
+// It initializes from genesis if no existing state is found.
+func NewManager(
+	chainID uint64,
+	sequencerAddr common.Address,
+	stateStore *execution.StateStore,
+	chainConfig *params.ChainConfig,
+	gen *genesis.Genesis,
+) (*Manager, error) {
+
+	logger := log.New("module", "state")
+	chainDB := execution.NewChainDB(stateStore.DiskDB())
+	executor := execution.NewEVMExecutor(chainConfig)
+
 	m := &Manager{
-		blocks:       make(map[uint64]*insoTypes.L2Block),
-		blockHashes:  make(map[common.Hash]uint64),
-		txIndex:      make(map[common.Hash]*types.Transaction),
-		txReceipts:   make(map[common.Hash]*types.Receipt),
-		txBlockIndex: make(map[common.Hash]uint64),
-		balances:     make(map[common.Address]*big.Int),
-		nonces:       make(map[common.Address]uint64),
-		chainID:      chainID,
+		stateStore:    stateStore,
+		chainDB:       chainDB,
+		executor:      executor,
+		chainConfig:   chainConfig,
 		sequencerAddr: sequencerAddr,
-		isSequencing: true,
-		logger:       log.New("module", "state"),
+		chainID:       chainID,
+		isSequencing:  true,
+		logger:        logger,
 	}
 
-	// Initialize genesis state root
-	h := sha256.New()
-	h.Write([]byte("insoblok-genesis"))
-	h.Write(new(big.Int).SetUint64(chainID).Bytes())
-	copy(m.stateRoot[:], h.Sum(nil))
+	// Check if we have existing state
+	existingRoot, err := chainDB.ReadGenesisRoot()
+	if err == nil && existingRoot != (common.Hash{}) {
+		// Restore from existing database
+		m.currentBlock = chainDB.CurrentBlock()
+		m.stateRoot = chainDB.LatestStateRoot()
+		logger.Info("State restored from database",
+			"currentBlock", m.currentBlock,
+			"stateRoot", m.stateRoot.Hex(),
+		)
 
-	// Pre-fund genesis accounts (matching devnet genesis)
-	genesisAccounts := map[common.Address]*big.Int{
-		common.HexToAddress("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"): parseEther("10000"), // deployer
-		common.HexToAddress("0x70997970C51812dc3A010C7d01b50e0d17dc79C8"): parseEther("10000"), // user1
-		common.HexToAddress("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"): parseEther("10000"), // user2
-		common.HexToAddress("0x90F79bf6EB2c4f870365E785982E1f101E93b906"): parseEther("100000"), // validator
+		// Restore L1 origin
+		if origin, err := chainDB.ReadL1Origin(); err == nil && origin != nil {
+			m.l1Origin = *origin
+		}
+
+		return m, nil
 	}
 
-	for addr, balance := range genesisAccounts {
-		m.balances[addr] = balance
+	// No existing state -- initialize from genesis
+	logger.Info("No existing state found, initializing from genesis")
+
+	sdb, err := stateStore.OpenState(common.Hash{})
+	if err != nil {
+		return nil, err
 	}
 
-	m.logger.Info("State manager initialized",
-		"chainID", chainID,
-		"genesisAccounts", len(genesisAccounts),
+	genesisRoot, err := gen.InitializeState(sdb)
+	if err != nil {
+		return nil, err
+	}
+
+	// Commit genesis state to disk
+	committedRoot, err := stateStore.CommitState(sdb, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	if genesisRoot != committedRoot {
+		logger.Warn("Genesis intermediate root differs from committed root",
+			"intermediate", genesisRoot.Hex(),
+			"committed", committedRoot.Hex(),
+		)
+	}
+
+	m.stateRoot = committedRoot
+	if err := chainDB.WriteGenesisRoot(committedRoot); err != nil {
+		return nil, err
+	}
+
+	logger.Info("Genesis state initialized",
+		"stateRoot", committedRoot.Hex(),
+		"accounts", len(gen.Alloc),
 	)
 
-	return m
+	return m, nil
 }
 
-func parseEther(amount string) *big.Int {
-	val, _ := new(big.Int).SetString(amount, 10)
-	return new(big.Int).Mul(val, big.NewInt(1e18))
+// --- State accessors (read current state) ---
+
+// OpenCurrentState returns a StateDB at the current state root.
+func (m *Manager) OpenCurrentState() (*ethState.StateDB, error) {
+	m.mu.RLock()
+	root := m.stateRoot
+	m.mu.RUnlock()
+	return m.stateStore.OpenState(root)
 }
 
 // CurrentBlock returns the latest block number.
@@ -101,33 +143,6 @@ func (m *Manager) CurrentBlock() uint64 {
 	return m.currentBlock
 }
 
-// GetBlock returns a block by number.
-func (m *Manager) GetBlock(num uint64) *insoTypes.L2Block {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.blocks[num]
-}
-
-// GetBlockByHash returns a block by its hash.
-func (m *Manager) GetBlockByHash(hash common.Hash) *insoTypes.L2Block {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if num, ok := m.blockHashes[hash]; ok {
-		return m.blocks[num]
-	}
-	return nil
-}
-
-// GetBlockHash returns the hash of a block by number.
-func (m *Manager) GetBlockHash(num uint64) common.Hash {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if block, ok := m.blocks[num]; ok {
-		return block.Header.Hash
-	}
-	return common.Hash{}
-}
-
 // GetLatestStateRoot returns the current state root.
 func (m *Manager) GetLatestStateRoot() common.Hash {
 	m.mu.RLock()
@@ -135,70 +150,240 @@ func (m *Manager) GetLatestStateRoot() common.Hash {
 	return m.stateRoot
 }
 
-// AddBlock persists a new L2 block and updates indices.
-func (m *Manager) AddBlock(block *insoTypes.L2Block) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// GetBlock returns a block by number.
+func (m *Manager) GetBlock(num uint64) *insoTypes.L2Block {
+	block, _ := m.chainDB.ReadBlock(num)
+	return block
+}
 
-	num := block.Header.Number
-	m.blocks[num] = block
-	m.blockHashes[block.Header.Hash] = num
-	m.currentBlock = num
-	m.stateRoot = block.Header.StateRoot
+// GetBlockByHash returns a block by its hash.
+func (m *Manager) GetBlockByHash(hash common.Hash) *insoTypes.L2Block {
+	block, _ := m.chainDB.ReadBlockByHash(hash)
+	return block
+}
 
-	// Index transactions
-	for _, tx := range block.Transactions {
-		m.txIndex[tx.Hash()] = tx
-		m.txBlockIndex[tx.Hash()] = num
-	}
+// GetBlockHash returns the hash of a block by number.
+func (m *Manager) GetBlockHash(num uint64) common.Hash {
+	return m.chainDB.ReadBlockHash(num)
 }
 
 // GetTransaction returns a transaction by hash.
 func (m *Manager) GetTransaction(hash common.Hash) *types.Transaction {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.txIndex[hash]
+	tx, _ := m.chainDB.ReadTransaction(hash)
+	return tx
 }
 
 // GetReceipt returns a transaction receipt by hash.
 func (m *Manager) GetReceipt(hash common.Hash) *types.Receipt {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.txReceipts[hash]
+	receipt, _ := m.chainDB.ReadReceipt(hash)
+	return receipt
 }
 
-// GetBalance returns the balance for an address.
+// GetBalance returns the balance for an address from current state.
 func (m *Manager) GetBalance(addr common.Address) *big.Int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if b, ok := m.balances[addr]; ok {
-		return new(big.Int).Set(b)
+	sdb, err := m.OpenCurrentState()
+	if err != nil {
+		return big.NewInt(0)
 	}
-	return big.NewInt(0)
+	return sdb.GetBalance(addr).ToBig()
 }
 
-// GetNonce returns the nonce for an address.
+// GetNonce returns the nonce for an address from current state.
 func (m *Manager) GetNonce(addr common.Address) uint64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.nonces[addr]
+	sdb, err := m.OpenCurrentState()
+	if err != nil {
+		return 0
+	}
+	return sdb.GetNonce(addr)
 }
 
-// GetL1Origin returns the latest known L1 block origin.
+// GetCode returns the code for an address from current state.
+func (m *Manager) GetCode(addr common.Address) []byte {
+	sdb, err := m.OpenCurrentState()
+	if err != nil {
+		return nil
+	}
+	return sdb.GetCode(addr)
+}
+
+// GetStorageAt returns a storage slot value for an address.
+func (m *Manager) GetStorageAt(addr common.Address, key common.Hash) common.Hash {
+	sdb, err := m.OpenCurrentState()
+	if err != nil {
+		return common.Hash{}
+	}
+	return sdb.GetState(addr, key)
+}
+
+// --- EVM execution ---
+
+// Executor returns the EVM executor for direct use (e.g., eth_call).
+func (m *Manager) Executor() *execution.EVMExecutor {
+	return m.executor
+}
+
+// ChainConfig returns the chain configuration.
+func (m *Manager) ChainConfig() *params.ChainConfig {
+	return m.chainConfig
+}
+
+// StateStore returns the underlying state store.
+func (m *Manager) StateStore() *execution.StateStore {
+	return m.stateStore
+}
+
+// ExecuteAndCommitBlock executes transactions, commits the state, and persists the block.
+// This is the main entry point called by the block producer.
+func (m *Manager) ExecuteAndCommitBlock(
+	txs []*types.Transaction,
+	blockNum uint64,
+	timestamp uint64,
+	parentHash common.Hash,
+	baseFee *big.Int,
+) (*insoTypes.L2Block, []*types.Transaction, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Open state at current root
+	sdb, err := m.stateStore.OpenState(m.stateRoot)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	signer := types.LatestSignerForChainID(new(big.Int).SetUint64(m.chainID))
+
+	execCtx := &execution.ExecutionContext{
+		BlockNumber: new(big.Int).SetUint64(blockNum),
+		Timestamp:   timestamp,
+		Coinbase:    m.sequencerAddr,
+		GasLimit:    30_000_000, // from config
+		BaseFee:     baseFee,
+		ParentHash:  parentHash,
+	}
+
+	// Execute all transactions through the EVM
+	results, skipped, cumulativeGas := m.executor.ExecuteTransactions(sdb, txs, execCtx, signer)
+
+	// Commit state to get the new Merkle Patricia Trie root
+	newRoot, err := m.stateStore.CommitState(sdb, blockNum)
+	if err != nil {
+		return nil, skipped, err
+	}
+
+	// Compute block hash
+	blockHash := computeBlockHash(blockNum, newRoot, timestamp, parentHash)
+
+	// Build receipts slice
+	receipts := make([]*types.Receipt, 0, len(results))
+	executedTxs := make([]*types.Transaction, 0, len(results))
+	for _, r := range results {
+		r.Receipt.BlockHash = blockHash
+		r.Receipt.BlockNumber = new(big.Int).SetUint64(blockNum)
+		receipts = append(receipts, r.Receipt)
+		// Find the corresponding tx
+		for _, tx := range txs {
+			if tx.Hash() == r.Receipt.TxHash {
+				executedTxs = append(executedTxs, tx)
+				break
+			}
+		}
+	}
+
+	header := &insoTypes.L2BlockHeader{
+		Number:        blockNum,
+		Hash:          blockHash,
+		ParentHash:    parentHash,
+		Timestamp:     timestamp,
+		StateRoot:     newRoot,
+		GasUsed:       cumulativeGas,
+		GasLimit:      execCtx.GasLimit,
+		TxCount:       len(executedTxs),
+		SequencerAddr: m.sequencerAddr,
+		L1Origin:      m.l1Origin,
+		BaseFee:       baseFee,
+	}
+
+	block := &insoTypes.L2Block{
+		Header:       header,
+		Transactions: executedTxs,
+		Receipts:     receipts,
+	}
+
+	// Persist block + indices to chain database
+	if err := m.chainDB.WriteBlock(block); err != nil {
+		return nil, skipped, err
+	}
+
+	// Update in-memory state
+	m.currentBlock = blockNum
+	m.stateRoot = newRoot
+
+	return block, skipped, nil
+}
+
+// CallContract executes a read-only call (eth_call).
+func (m *Manager) CallContract(msg *core.Message, blockNum uint64) ([]byte, uint64, error) {
+	m.mu.RLock()
+	root := m.stateRoot
+	m.mu.RUnlock()
+
+	sdb, err := m.stateStore.OpenState(root)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	blockCtx := m.buildBlockContext(blockNum)
+	return m.executor.CallContract(sdb, msg, &blockCtx)
+}
+
+// EstimateGas estimates the gas required for a transaction.
+func (m *Manager) EstimateGas(msg *core.Message, blockNum uint64) (uint64, error) {
+	m.mu.RLock()
+	root := m.stateRoot
+	m.mu.RUnlock()
+
+	sdb, err := m.stateStore.OpenState(root)
+	if err != nil {
+		return 0, err
+	}
+
+	blockCtx := m.buildBlockContext(blockNum)
+	return m.executor.EstimateGas(sdb, msg, &blockCtx)
+}
+
+func (m *Manager) buildBlockContext(blockNum uint64) vm.BlockContext {
+	return vm.BlockContext{
+		CanTransfer: core.CanTransfer,
+		Transfer:    core.Transfer,
+		GetHash: func(n uint64) common.Hash {
+			return m.GetBlockHash(n)
+		},
+		Coinbase:    m.sequencerAddr,
+		BlockNumber: new(big.Int).SetUint64(blockNum),
+		Time:        uint64(0), // caller fills in
+		GasLimit:    30_000_000,
+		BaseFee:     big.NewInt(1_000_000_000),
+	}
+}
+
+// --- L1 origin ---
+
 func (m *Manager) GetL1Origin() insoTypes.L1Origin {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.l1Origin
 }
 
-// SetL1Origin updates the L1 origin reference.
 func (m *Manager) SetL1Origin(origin insoTypes.L1Origin) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.l1Origin = origin
+	_ = m.chainDB.WriteL1Origin(&origin)
 }
 
-// GetSequencerStatus returns the current sequencer status.
+// --- Sequencer status ---
+
 func (m *Manager) GetSequencerStatus() *insoTypes.SequencerStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -210,28 +395,39 @@ func (m *Manager) GetSequencerStatus() *insoTypes.SequencerStatus {
 	}
 }
 
-// AddBatch records a batch submission.
+// --- Batch operations ---
+
 func (m *Manager) AddBatch(batch *insoTypes.Batch) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.batches = append(m.batches, batch)
-	m.latestBatch = batch
+	_ = m.chainDB.WriteBatch(batch)
 }
 
-// GetLatestBatch returns the most recent batch submission.
 func (m *Manager) GetLatestBatch() *insoTypes.Batch {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.latestBatch
+	batch, _ := m.chainDB.ReadLatestBatch()
+	return batch
 }
 
-// SimulateL1Submission generates a mock L1 tx hash for devnet.
 func (m *Manager) SimulateL1Submission(startBlock, endBlock uint64) common.Hash {
-	h := sha256.New()
-	h.Write([]byte("l1-batch"))
-	h.Write(new(big.Int).SetUint64(startBlock).Bytes())
-	h.Write(new(big.Int).SetUint64(endBlock).Bytes())
-	var hash common.Hash
-	copy(hash[:], h.Sum(nil))
-	return hash
+	// Compute deterministic hash for simulated submission
+	h := common.BytesToHash(
+		new(big.Int).Add(
+			new(big.Int).SetUint64(startBlock),
+			new(big.Int).SetUint64(endBlock),
+		).Bytes(),
+	)
+	return h
+}
+
+// Close shuts down the state manager and persists all data.
+func (m *Manager) Close() error {
+	return m.stateStore.Close()
+}
+
+// computeBlockHash produces a deterministic block hash from block data.
+func computeBlockHash(blockNum uint64, stateRoot common.Hash, timestamp uint64, parentHash common.Hash) common.Hash {
+	data := make([]byte, 0, 8+32+8+32)
+	data = append(data, new(big.Int).SetUint64(blockNum).Bytes()...)
+	data = append(data, stateRoot.Bytes()...)
+	data = append(data, new(big.Int).SetUint64(timestamp).Bytes()...)
+	data = append(data, parentHash.Bytes()...)
+	return common.BytesToHash(data)
 }

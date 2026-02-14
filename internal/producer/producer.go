@@ -2,8 +2,6 @@ package producer
 
 import (
 	"context"
-	"crypto/sha256"
-	"math/big"
 	"sync"
 	"time"
 
@@ -12,32 +10,41 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 
 	"github.com/insoblok/inso-sequencer/internal/config"
+	"github.com/insoblok/inso-sequencer/internal/fees"
 	"github.com/insoblok/inso-sequencer/internal/mempool"
 	"github.com/insoblok/inso-sequencer/internal/state"
-	insoTypes "github.com/insoblok/inso-sequencer/pkg/types"
 )
 
 // Producer is the block production engine. It periodically drains the mempool,
-// executes transactions, computes a new state root, and appends a new L2 block.
+// executes transactions through the EVM, and persists new L2 blocks.
+// Phase 4: uses DynamicFeeModel for EIP-1559–style base fee adjustments
+// with sovereignty-tier discounts.
 type Producer struct {
 	mu        sync.Mutex
 	cfg       *config.SequencerConfig
 	mempool   *mempool.Mempool
 	state     *state.Manager
+	feeModel  *fees.DynamicFeeModel
 	logger    log.Logger
 	sequencer common.Address
 	cancel    context.CancelFunc
 }
 
 // New creates a new block producer.
-func New(cfg *config.SequencerConfig, mp *mempool.Mempool, sm *state.Manager, sequencerAddr common.Address) *Producer {
+func New(cfg *config.SequencerConfig, mp *mempool.Mempool, sm *state.Manager, sequencerAddr common.Address, fm *fees.DynamicFeeModel) *Producer {
 	return &Producer{
 		cfg:       cfg,
 		mempool:   mp,
 		state:     sm,
+		feeModel:  fm,
 		logger:    log.New("module", "producer"),
 		sequencer: sequencerAddr,
 	}
+}
+
+// FeeModel returns the dynamic fee model for RPC/external access.
+func (p *Producer) FeeModel() *fees.DynamicFeeModel {
+	return p.feeModel
 }
 
 // Start begins the block production loop. Runs until the context is cancelled.
@@ -71,6 +78,8 @@ func (p *Producer) Stop() {
 }
 
 // produceBlock creates a single L2 block from the current mempool.
+// It drains pending transactions, executes them through the EVM,
+// computes a real Merkle Patricia Trie state root, and persists everything.
 func (p *Producer) produceBlock(ctx context.Context) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -78,79 +87,71 @@ func (p *Producer) produceBlock(ctx context.Context) {
 	// Drain transactions from mempool ordered by priority
 	txMetas := p.mempool.PopBatch(p.cfg.MaxTxPerBlock, p.cfg.MaxBlockGas)
 
-	// Even if empty, we produce a block (heartbeat)
 	blockNum := p.state.CurrentBlock() + 1
 	now := uint64(time.Now().Unix())
+	parentHash := p.state.GetBlockHash(blockNum - 1)
+	baseFee := p.feeModel.BaseFee() // Phase 4: dynamic base fee
 
 	// Collect raw transactions
 	txs := make([]*types.Transaction, 0, len(txMetas))
-	var gasUsed uint64
 	for _, meta := range txMetas {
 		txs = append(txs, meta.Tx)
-		gasUsed += meta.Tx.Gas()
 	}
 
-	// Compute state root (simplified: hash of block number + tx hashes)
-	stateRoot := p.computeStateRoot(blockNum, txs)
-
-	// Compute block hash
-	blockHash := p.computeBlockHash(blockNum, stateRoot, now)
-
-	// Get L1 origin (latest known L1 block)
-	l1Origin := p.state.GetL1Origin()
-
-	header := &insoTypes.L2BlockHeader{
-		Number:        blockNum,
-		Hash:          blockHash,
-		ParentHash:    p.state.GetBlockHash(blockNum - 1),
-		Timestamp:     now,
-		StateRoot:     stateRoot,
-		GasUsed:       gasUsed,
-		GasLimit:      p.cfg.MaxBlockGas,
-		TxCount:       len(txs),
-		SequencerAddr: p.sequencer,
-		L1Origin:      l1Origin,
-		BaseFee:       big.NewInt(1_000_000_000), // 1 gwei fixed
+	// Execute transactions through EVM and commit state
+	block, skipped, err := p.state.ExecuteAndCommitBlock(txs, blockNum, now, parentHash, baseFee)
+	if err != nil {
+		p.logger.Error("Failed to produce block", "number", blockNum, "err", err)
+		// Return skipped txs to mempool
+		for _, tx := range txs {
+			// Best-effort: re-add all txs if block production failed completely
+			_ = p.mempool.Add(tx, common.Address{}, 0)
+		}
+		return
 	}
 
-	block := insoTypes.NewL2Block(header, txs)
+	// Return skipped txs to mempool for next block
+	for _, tx := range skipped {
+		for _, meta := range txMetas {
+			if meta.Tx.Hash() == tx.Hash() {
+				_ = p.mempool.Add(tx, meta.Sender, meta.TasteScore)
+				break
+			}
+		}
+	}
 
-	// Persist the block
-	p.state.AddBlock(block)
-
-	if len(txs) > 0 {
+	executedCount := block.Header.TxCount
+	if executedCount > 0 {
 		p.logger.Info("Block produced",
 			"number", blockNum,
-			"txCount", len(txs),
-			"gasUsed", gasUsed,
-			"hash", blockHash.Hex()[:10],
+			"txCount", executedCount,
+			"gasUsed", block.Header.GasUsed,
+			"stateRoot", block.Header.StateRoot.Hex()[:10],
+			"hash", block.Header.Hash.Hex()[:10],
+			"skipped", len(skipped),
+			"baseFee", baseFee,
 		)
+
+		// Log receipt details for debugging
+		for _, receipt := range block.Receipts {
+			status := "success"
+			if receipt.Status == types.ReceiptStatusFailed {
+				status = "failed"
+			}
+			p.logger.Debug("Transaction receipt",
+				"txHash", receipt.TxHash.Hex()[:10],
+				"status", status,
+				"gasUsed", receipt.GasUsed,
+				"logs", len(receipt.Logs),
+			)
+		}
 	} else {
-		p.logger.Debug("Empty block produced", "number", blockNum)
+		p.logger.Debug("Empty block produced",
+			"number", blockNum,
+			"stateRoot", block.Header.StateRoot.Hex()[:10],
+		)
 	}
-}
 
-// computeStateRoot produces a deterministic (but simplified) state root.
-// In a real implementation this would be a Merkle Patricia Trie root.
-func (p *Producer) computeStateRoot(blockNum uint64, txs []*types.Transaction) common.Hash {
-	h := sha256.New()
-	h.Write(new(big.Int).SetUint64(blockNum).Bytes())
-	h.Write(p.state.GetLatestStateRoot().Bytes())
-	for _, tx := range txs {
-		h.Write(tx.Hash().Bytes())
-	}
-	var root common.Hash
-	copy(root[:], h.Sum(nil))
-	return root
-}
-
-// computeBlockHash produces a deterministic block hash.
-func (p *Producer) computeBlockHash(blockNum uint64, stateRoot common.Hash, timestamp uint64) common.Hash {
-	h := sha256.New()
-	h.Write(new(big.Int).SetUint64(blockNum).Bytes())
-	h.Write(stateRoot.Bytes())
-	h.Write(new(big.Int).SetUint64(timestamp).Bytes())
-	var hash common.Hash
-	copy(hash[:], h.Sum(nil))
-	return hash
+	// Phase 4: adjust base fee based on block gas utilization
+	p.feeModel.AdjustAfterBlock(block.Header.GasUsed, p.cfg.MaxBlockGas)
 }

@@ -38,6 +38,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleHTTP)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/ready", s.handleReady)
 
 	s.httpServer = &http.Server{
 		Addr:         s.cfg.ListenAddr,
@@ -137,13 +138,38 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.handleHTTP(w, r)
 }
 
-// handleHealth returns a simple health check response.
+// handleHealth returns a liveness check response.
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "ok",
-		"service": "inso-sequencer",
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":       "ok",
+		"service":      "inso-sequencer",
+		"version":      "phase5",
+		"currentBlock": s.handler.state.CurrentBlock(),
+		"chainID":      s.handler.chainID.Uint64(),
+	})
+}
+
+// handleReady returns 200 only when the sequencer is fully operational.
+func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	block := s.handler.state.CurrentBlock()
+	// Sequencer is "ready" once it has processed at least the genesis block
+	if block == 0 {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "not_ready",
+			"service": "inso-sequencer",
+			"reason":  "no blocks produced yet",
+		})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":       "ready",
+		"service":      "inso-sequencer",
+		"currentBlock": block,
 	})
 }
 

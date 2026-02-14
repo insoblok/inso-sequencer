@@ -4,6 +4,8 @@ sequencer:
   block_time: 500ms
   max_block_gas: 30000000
   max_tx_per_block: 5000
+  chain_id: 42069
+  datadir: "./data"
 
 l1:
   rpc_url: "http://localhost:8551"

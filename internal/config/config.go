@@ -10,11 +10,13 @@ import (
 
 // Config is the top-level sequencer configuration.
 type Config struct {
-	Sequencer  SequencerConfig  `yaml:"sequencer"`
-	L1         L1Config         `yaml:"l1"`
-	TasteScore TasteScoreConfig `yaml:"tastescore"`
-	Logging    LoggingConfig    `yaml:"logging"`
-	Metrics    MetricsConfig    `yaml:"metrics"`
+	Sequencer   SequencerConfig   `yaml:"sequencer"`
+	L1          L1Config          `yaml:"l1"`
+	TasteScore  TasteScoreConfig  `yaml:"tastescore"`
+	DID         DIDConfig         `yaml:"did"`
+	Sovereignty SovereigntyConfig `yaml:"sovereignty"`
+	Logging     LoggingConfig     `yaml:"logging"`
+	Metrics     MetricsConfig     `yaml:"metrics"`
 }
 
 // SequencerConfig holds the core sequencer settings.
@@ -58,6 +60,21 @@ type MetricsConfig struct {
 	Addr    string `yaml:"addr"`
 }
 
+// DIDConfig holds DID (Decentralized Identity) integration settings.
+type DIDConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	RegistryAddress string `yaml:"registry_address"` // DIDRegistry contract address
+}
+
+// SovereigntyConfig holds sovereignty engine settings.
+type SovereigntyConfig struct {
+	Enabled        bool   `yaml:"enabled"`
+	EngineAddress  string `yaml:"engine_address"`   // SovereigntyEngine contract address
+	OracleAddress  string `yaml:"oracle_address"`   // TasteScoreOracle contract address
+	SBTAddress     string `yaml:"sbt_address"`      // InSoSBT contract address
+	FeeDiscounts   bool   `yaml:"fee_discounts"`    // Enable sovereignty-based fee discounts
+}
+
 // Load reads and parses a YAML config file.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -98,6 +115,13 @@ func DefaultConfig() *Config {
 			APIURL:         "https://api.insoblokai.io",
 			OrderingWeight: 0.3,
 			CacheTTL:       60 * time.Second,
+		},
+		DID: DIDConfig{
+			Enabled: true,
+		},
+		Sovereignty: SovereigntyConfig{
+			Enabled:      true,
+			FeeDiscounts: true,
 		},
 		Logging: LoggingConfig{
 			Level:  "info",

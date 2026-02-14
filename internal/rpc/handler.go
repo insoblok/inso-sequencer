@@ -4,14 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 
+	"github.com/insoblok/inso-sequencer/internal/fees"
 	"github.com/insoblok/inso-sequencer/internal/mempool"
 	"github.com/insoblok/inso-sequencer/internal/state"
 	"github.com/insoblok/inso-sequencer/internal/tastescore"
@@ -22,16 +25,18 @@ type Handler struct {
 	mempool    *mempool.Mempool
 	state      *state.Manager
 	tastescore *tastescore.Client
+	feeModel   *fees.DynamicFeeModel
 	chainID    *big.Int
 	logger     log.Logger
 }
 
 // NewHandler creates a new JSON-RPC handler.
-func NewHandler(mp *mempool.Mempool, sm *state.Manager, ts *tastescore.Client, chainID uint64) *Handler {
+func NewHandler(mp *mempool.Mempool, sm *state.Manager, ts *tastescore.Client, chainID uint64, fm *fees.DynamicFeeModel) *Handler {
 	return &Handler{
 		mempool:    mp,
 		state:      sm,
 		tastescore: ts,
+		feeModel:   fm,
 		chainID:    new(big.Int).SetUint64(chainID),
 		logger:     log.New("module", "rpc-handler"),
 	}
@@ -65,9 +70,17 @@ func (h *Handler) Handle(ctx context.Context, req *JSONRPCRequest) *JSONRPCRespo
 	case "eth_getTransactionCount":
 		result, err = h.getTransactionCount(req.Params)
 	case "eth_gasPrice":
-		result = hexutil.EncodeBig(big.NewInt(1_000_000_000)) // 1 gwei fixed
+		result = hexutil.EncodeBig(h.feeModel.BaseFee()) // Phase 4: dynamic base fee
 	case "eth_estimateGas":
-		result = hexutil.EncodeUint64(21000) // simplified estimate
+		result, err = h.estimateGas(req.Params)
+	case "eth_call":
+		result, err = h.ethCall(req.Params)
+	case "eth_getCode":
+		result, err = h.getCode(req.Params)
+	case "eth_getStorageAt":
+		result, err = h.getStorageAt(req.Params)
+	case "eth_getLogs":
+		result, err = h.getLogs(req.Params)
 	case "net_version":
 		result = fmt.Sprintf("%d", h.chainID.Uint64())
 
@@ -80,6 +93,12 @@ func (h *Handler) Handle(ctx context.Context, req *JSONRPCRequest) *JSONRPCRespo
 		result = h.getBatchStatus()
 	case "inso_getPendingTxCount":
 		result = h.mempool.Len()
+	case "inso_getFeeStats":
+		result = h.feeModel.Stats()
+	case "inso_getEffectiveFee":
+		result, err = h.getEffectiveFee(req.Params)
+	case "inso_getSovereigntyDiscount":
+		result, err = h.getSovereigntyDiscount(req.Params)
 
 	default:
 		return &JSONRPCResponse{
@@ -268,4 +287,289 @@ func (h *Handler) getTasteScoreOrdering() interface{} {
 
 func (h *Handler) getBatchStatus() interface{} {
 	return h.state.GetLatestBatch()
+}
+
+// --- EVM-backed methods (Phase 2) ---
+
+// callArgs represents the arguments for eth_call / eth_estimateGas.
+type callArgs struct {
+	From     *common.Address `json:"from"`
+	To       *common.Address `json:"to"`
+	Gas      *hexutil.Uint64 `json:"gas"`
+	GasPrice *hexutil.Big    `json:"gasPrice"`
+	Value    *hexutil.Big    `json:"value"`
+	Data     *hexutil.Bytes  `json:"data"`
+	Input    *hexutil.Bytes  `json:"input"`
+}
+
+// toMessage converts callArgs to a core.Message for EVM execution.
+func (args *callArgs) toMessage(baseFee *big.Int) *core.Message {
+	from := common.Address{}
+	if args.From != nil {
+		from = *args.From
+	}
+
+	gas := uint64(math.MaxUint64 / 2)
+	if args.Gas != nil {
+		gas = uint64(*args.Gas)
+	}
+
+	var gasPrice *big.Int
+	if args.GasPrice != nil {
+		gasPrice = args.GasPrice.ToInt()
+	} else if baseFee != nil {
+		gasPrice = new(big.Int).Set(baseFee)
+	} else {
+		gasPrice = big.NewInt(1_000_000_000)
+	}
+
+	var value *big.Int
+	if args.Value != nil {
+		value = args.Value.ToInt()
+	} else {
+		value = big.NewInt(0)
+	}
+
+	var data []byte
+	if args.Input != nil {
+		data = *args.Input
+	} else if args.Data != nil {
+		data = *args.Data
+	}
+
+	return &core.Message{
+		From:     from,
+		To:       args.To,
+		GasLimit: gas,
+		GasPrice: gasPrice,
+		Value:    value,
+		Data:     data,
+	}
+}
+
+func (h *Handler) ethCall(params json.RawMessage) (interface{}, error) {
+	var args []json.RawMessage
+	if err := json.Unmarshal(params, &args); err != nil || len(args) == 0 {
+		return nil, fmt.Errorf("invalid params")
+	}
+
+	var ca callArgs
+	if err := json.Unmarshal(args[0], &ca); err != nil {
+		return nil, fmt.Errorf("invalid call args: %w", err)
+	}
+
+	msg := ca.toMessage(h.feeModel.BaseFee())
+	blockNum := h.state.CurrentBlock()
+
+	result, _, err := h.state.CallContract(msg, blockNum)
+	if err != nil {
+		return nil, fmt.Errorf("execution failed: %w", err)
+	}
+
+	return hexutil.Encode(result), nil
+}
+
+func (h *Handler) estimateGas(params json.RawMessage) (interface{}, error) {
+	var args []json.RawMessage
+	if err := json.Unmarshal(params, &args); err != nil || len(args) == 0 {
+		return nil, fmt.Errorf("invalid params")
+	}
+
+	var ca callArgs
+	if err := json.Unmarshal(args[0], &ca); err != nil {
+		return nil, fmt.Errorf("invalid call args: %w", err)
+	}
+
+	msg := ca.toMessage(h.feeModel.BaseFee())
+	blockNum := h.state.CurrentBlock()
+
+	gas, err := h.state.EstimateGas(msg, blockNum)
+	if err != nil {
+		return nil, fmt.Errorf("gas estimation failed: %w", err)
+	}
+
+	return hexutil.EncodeUint64(gas), nil
+}
+
+func (h *Handler) getCode(params json.RawMessage) (interface{}, error) {
+	var args []string
+	if err := json.Unmarshal(params, &args); err != nil || len(args) == 0 {
+		return nil, fmt.Errorf("invalid params")
+	}
+
+	addr := common.HexToAddress(args[0])
+	code := h.state.GetCode(addr)
+	if code == nil {
+		return "0x", nil
+	}
+	return hexutil.Encode(code), nil
+}
+
+func (h *Handler) getStorageAt(params json.RawMessage) (interface{}, error) {
+	var args []string
+	if err := json.Unmarshal(params, &args); err != nil || len(args) < 2 {
+		return nil, fmt.Errorf("invalid params: need [address, key]")
+	}
+
+	addr := common.HexToAddress(args[0])
+	key := common.HexToHash(args[1])
+	val := h.state.GetStorageAt(addr, key)
+	return val.Hex(), nil
+}
+
+// logFilterArgs represents the arguments for eth_getLogs.
+type logFilterArgs struct {
+	FromBlock *string          `json:"fromBlock"`
+	ToBlock   *string          `json:"toBlock"`
+	Address   *common.Address  `json:"address"`
+	Topics    [][]common.Hash  `json:"topics"`
+}
+
+func (h *Handler) getLogs(params json.RawMessage) (interface{}, error) {
+	var args []json.RawMessage
+	if err := json.Unmarshal(params, &args); err != nil || len(args) == 0 {
+		return nil, fmt.Errorf("invalid params")
+	}
+
+	var filter logFilterArgs
+	if err := json.Unmarshal(args[0], &filter); err != nil {
+		return nil, fmt.Errorf("invalid filter: %w", err)
+	}
+
+	// Parse block range
+	currentBlock := h.state.CurrentBlock()
+	fromBlock := uint64(0)
+	toBlock := currentBlock
+
+	if filter.FromBlock != nil {
+		if *filter.FromBlock == "latest" {
+			fromBlock = currentBlock
+		} else {
+			n, err := hexutil.DecodeUint64(*filter.FromBlock)
+			if err == nil {
+				fromBlock = n
+			}
+		}
+	}
+
+	if filter.ToBlock != nil {
+		if *filter.ToBlock == "latest" {
+			toBlock = currentBlock
+		} else {
+			n, err := hexutil.DecodeUint64(*filter.ToBlock)
+			if err == nil {
+				toBlock = n
+			}
+		}
+	}
+
+	// Cap range to prevent excessive scanning
+	if toBlock-fromBlock > 1000 {
+		toBlock = fromBlock + 1000
+	}
+
+	// Collect matching logs from block receipts
+	var matchingLogs []*types.Log
+	for blockNum := fromBlock; blockNum <= toBlock; blockNum++ {
+		block := h.state.GetBlock(blockNum)
+		if block == nil {
+			continue
+		}
+
+		for _, receipt := range block.Receipts {
+			for _, l := range receipt.Logs {
+				if matchLog(l, filter.Address, filter.Topics) {
+					matchingLogs = append(matchingLogs, l)
+				}
+			}
+		}
+	}
+
+	if matchingLogs == nil {
+		matchingLogs = make([]*types.Log, 0)
+	}
+
+	return matchingLogs, nil
+}
+
+// matchLog checks if a log matches the given filter criteria.
+func matchLog(l *types.Log, addr *common.Address, topics [][]common.Hash) bool {
+	// Address filter
+	if addr != nil && l.Address != *addr {
+		return false
+	}
+
+	// Topic filters
+	for i, topicFilter := range topics {
+		if len(topicFilter) == 0 {
+			continue // wildcard
+		}
+		if i >= len(l.Topics) {
+			return false
+		}
+		matched := false
+		for _, t := range topicFilter {
+			if l.Topics[i] == t {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+
+	return true
+}
+
+// --- Phase 4: DID & Sovereignty RPC methods ---
+
+// getEffectiveFee returns the sovereignty-discounted gas price for an address.
+func (h *Handler) getEffectiveFee(params json.RawMessage) (interface{}, error) {
+	var args []string
+	if err := json.Unmarshal(params, &args); err != nil || len(args) == 0 {
+		return nil, fmt.Errorf("invalid params: need [address]")
+	}
+
+	addr := common.HexToAddress(args[0])
+	effectiveFee := h.feeModel.EffectiveFee(addr, nil) // no on-chain provider wired yet
+	discountBps, tier := h.feeModel.GetDiscount(addr)
+
+	tierNames := []string{"None", "Bronze", "Silver", "Gold", "Platinum"}
+	tierName := "None"
+	if int(tier) < len(tierNames) {
+		tierName = tierNames[tier]
+	}
+
+	return map[string]interface{}{
+		"baseFee":      hexutil.EncodeBig(h.feeModel.BaseFee()),
+		"effectiveFee": hexutil.EncodeBig(effectiveFee),
+		"discountBps":  discountBps,
+		"tier":         tier,
+		"tierName":     tierName,
+	}, nil
+}
+
+// getSovereigntyDiscount returns the cached sovereignty discount for an address.
+func (h *Handler) getSovereigntyDiscount(params json.RawMessage) (interface{}, error) {
+	var args []string
+	if err := json.Unmarshal(params, &args); err != nil || len(args) == 0 {
+		return nil, fmt.Errorf("invalid params: need [address]")
+	}
+
+	addr := common.HexToAddress(args[0])
+	discountBps, tier := h.feeModel.GetDiscount(addr)
+
+	tierNames := []string{"None", "Bronze", "Silver", "Gold", "Platinum"}
+	tierName := "None"
+	if int(tier) < len(tierNames) {
+		tierName = tierNames[tier]
+	}
+
+	return map[string]interface{}{
+		"address":     addr.Hex(),
+		"discountBps": discountBps,
+		"tier":        tier,
+		"tierName":    tierName,
+	}, nil
 }
