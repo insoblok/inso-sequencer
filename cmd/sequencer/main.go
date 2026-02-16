@@ -94,16 +94,35 @@ func main() {
 		"apiUrl", cfg.TasteScore.APIURL,
 	)
 
-	// Initialize mempool
-	mp := mempool.New(cfg.TasteScore.OrderingWeight, cfg.Sequencer.MaxTxPerBlock*10)
-	logger.Info("Mempool initialized",
+	// Initialize laned mempool (reputation-gated execution lanes)
+	mp := mempool.NewLanedMempool(cfg.TasteScore.OrderingWeight, cfg.Sequencer.MaxTxPerBlock*10)
+	logger.Info("Laned mempool initialized",
 		"tasteScoreWeight", cfg.TasteScore.OrderingWeight,
 		"maxSize", cfg.Sequencer.MaxTxPerBlock*10,
 	)
 
-	// Initialize block producer
+	// Initialize block producer with adaptive sizing and compute receipts
 	feeModel := fees.NewDynamicFeeModel()
 	blockProducer := producer.New(&cfg.Sequencer, mp, stateManager, sequencerAddr, feeModel)
+
+	// Attach adaptive block sizer (Feature #4)
+	adaptiveSizer := producer.NewAdaptiveBlockSizer(producer.AdaptiveSizerConfig{
+		MinGasLimit:       cfg.AdaptiveBlock.MinGasLimit,
+		MaxGasLimit:       cfg.AdaptiveBlock.MaxGasLimit,
+		InitialGasLimit:   cfg.Sequencer.MaxBlockGas,
+		MinMaxTx:          cfg.AdaptiveBlock.MinMaxTx,
+		MaxMaxTx:          cfg.AdaptiveBlock.MaxMaxTx,
+		InitialMaxTx:      cfg.Sequencer.MaxTxPerBlock,
+		Alpha:             cfg.AdaptiveBlock.Alpha,
+		TargetUtilization: cfg.AdaptiveBlock.TargetUtilization,
+		AdjustStepBps:     cfg.AdaptiveBlock.AdjustStepBps,
+	})
+	blockProducer.SetAdaptiveSizer(adaptiveSizer)
+
+	// Attach verifiable compute receipt store (Feature #10)
+	receiptStore := execution.NewReceiptStore()
+	blockProducer.SetReceiptStore(receiptStore)
+
 	logger.Info("Dynamic fee model initialized",
 		"baseFee", feeModel.BaseFee(),
 		"sovereigntyDiscounts", cfg.Sovereignty.FeeDiscounts,
@@ -115,6 +134,9 @@ func main() {
 
 	// Initialize RPC handler & server
 	rpcHandler := rpc.NewHandler(mp, stateManager, tsClient, cfg.Sequencer.ChainID, feeModel)
+	rpcHandler.SetReceiptStore(receiptStore)
+	rpcHandler.SetLanedPool(mp)
+	rpcHandler.SetAdaptiveSizer(adaptiveSizer)
 	rpcServer := rpc.NewServer(&cfg.Sequencer, rpcHandler)
 
 	// Start all services
@@ -141,8 +163,17 @@ func main() {
 
 	// Start Prometheus metrics endpoint
 	met := metrics.New()
-	met.Serve(":6060")
-	logger.Info("Metrics server started", "addr", ":6060")
+	metricsAddr := cfg.Metrics.Addr
+	if metricsAddr == "" {
+		metricsAddr = "0.0.0.0:6060"
+	}
+	met.Serve(metricsAddr)
+	logger.Info("Metrics server started", "addr", metricsAddr)
+
+	// Wire metrics into components
+	blockProducer.SetMetrics(met)
+	rpcHandler.SetMetrics(met)
+	batchSubmitter.SetMetrics(met)
 
 	fmt.Println()
 	logger.Info("═══════════════════════════════════════════════")

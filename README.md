@@ -5,26 +5,33 @@ The transaction sequencer for the InSoBlok L2 blockchain. Responsible for orderi
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   InSo Sequencer                     │
-├──────────────┬──────────────┬───────────────────────┤
-│  RPC Server  │  Mempool     │  Batch Submitter       │
-│  (JSON-RPC)  │  (Fair FIFO) │  (L1 Calldata/Blobs)  │
-├──────────────┴──────────────┴───────────────────────┤
-│              Block Producer Engine                   │
-│  ┌────────────┐  ┌──────────────┐  ┌──────────────┐ │
-│  │ TasteScore │  │ Transaction  │  │  State Root   │ │
-│  │  Ordering  │  │  Execution   │  │  Computation  │ │
-│  └────────────┘  └──────────────┘  └──────────────┘ │
-├─────────────────────────────────────────────────────┤
-│                    EVM Engine                         │
-│              (go-ethereum fork)                       │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                      InSo Sequencer                       │
+├───────────────┬─────────────────┬────────────────────────┤
+│  RPC Server   │  Laned Mempool  │  Batch Submitter        │
+│  (JSON-RPC)   │  Fast/Std/Slow  │  (L1 Calldata/Blobs)   │
+├───────────────┴─────────────────┴────────────────────────┤
+│               Block Producer Engine                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐  │
+│  │  TasteScore  │  │  Adaptive    │  │   Compute      │  │
+│  │  Ordering    │  │  Block Sizer │  │   Receipts     │  │
+│  └──────────────┘  └──────────────┘  └────────────────┘  │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐  │
+│  │  Transaction │  │  State Root  │  │   Receipt      │  │
+│  │  Execution   │  │  Computation │  │   Store        │  │
+│  └──────────────┘  └──────────────┘  └────────────────┘  │
+├──────────────────────────────────────────────────────────┤
+│                       EVM Engine                          │
+│                  (go-ethereum fork)                        │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## Features
 
 - **Fair Transaction Ordering** — TasteScore-weighted FIFO prevents MEV and front-running
+- **Reputation-Gated Execution Lanes** — Fast/Standard/Slow lanes based on sovereignty tiers
+- **Adaptive Block Architecture** — EMA-based gas limits (15M–60M) and tx caps (1K–10K) that respond to utilization
+- **Verifiable Compute Receipts** — Per-transaction receipts with Merkle root for verifiable execution proofs
 - **High Throughput** — Targets 10,000+ TPS with sub-second block times
 - **Fixed Fees** — Predictable transaction costs independent of network congestion
 - **EVM Compatible** — Full EVM equivalence via go-ethereum execution engine
@@ -102,20 +109,28 @@ inso-sequencer/
 │   ├── config/             # Configuration loading
 │   ├── rpc/                # JSON-RPC & WebSocket server
 │   ├── mempool/            # Transaction pool with fair ordering
+│   │   ├── mempool.go      #   Basic FIFO mempool
+│   │   ├── pool.go         #   TxPool interface (shared by Mempool & LanedMempool)
+│   │   └── lanes.go        #   Reputation-gated execution lanes (Fast/Std/Slow)
 │   ├── producer/           # Block production engine
-│   ├── executor/           # EVM transaction execution
+│   │   ├── producer.go     #   Block producer (adaptive gas limits + receipt generation)
+│   │   └── adaptive.go     #   Adaptive block sizer (EMA-based utilization tracking)
+│   ├── execution/          # EVM transaction execution
+│   │   ├── evm.go          #   EVM executor
+│   │   ├── statestore.go   #   State store (PebbleDB)
+│   │   ├── chaindb.go      #   Chain database
+│   │   └── receipts.go     #   Verifiable compute receipts + Merkle root
 │   ├── batcher/            # L1 batch submission
+│   ├── fees/               # Fee management
+│   ├── genesis/            # Genesis state initialization
+│   ├── metrics/            # Prometheus metrics
 │   ├── tastescore/         # TasteScore integration client
 │   └── state/              # State management & root computation
 ├── pkg/
 │   └── types/              # Shared types (Block, Transaction, etc.)
-├── scripts/                # Dev & deployment scripts
-├── docker/                 # Dockerfiles & compose
-├── docs/                   # Architecture & protocol docs
 ├── Makefile
 ├── Dockerfile
 ├── go.mod
-├── go.sum
 └── README.md
 ```
 
@@ -131,6 +146,10 @@ Standard Ethereum JSON-RPC plus InSoBlok extensions:
 | `inso_getSequencerStatus` | Sequencer health & sync status |
 | `inso_getTasteScoreOrdering` | Current TasteScore ordering queue |
 | `inso_getBatchStatus` | L1 batch submission status |
+| `inso_getLaneStats` | Execution lane stats (count, gas per lane + thresholds) |
+| `inso_getAdaptiveBlockStats` | Current adaptive block parameters (gas limit, max tx, utilization EMA) |
+| `inso_getComputeReceipt` | Retrieve verifiable compute receipt by transaction hash |
+| `inso_getBlockReceiptRoot` | Get Merkle receipt root for all transactions in a block |
 
 ## Contributing
 

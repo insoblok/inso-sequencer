@@ -21,6 +21,27 @@ tastescore:
   ordering_weight: 0.3
   cache_ttl: 60s
 
+did:
+  enabled: true
+  registry_address: ""
+
+sovereignty:
+  enabled: true
+  engine_address: ""
+  oracle_address: ""
+  sbt_address: ""
+  fee_discounts: true
+
+adaptive_block:
+  enabled: true
+  min_gas_limit: 15000000
+  max_gas_limit: 60000000
+  min_max_tx: 1000
+  max_max_tx: 10000
+  alpha: 0.2
+  target_utilization: 0.5
+  adjust_step_bps: 500
+
 logging:
   level: info
   format: json

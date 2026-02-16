@@ -38,6 +38,23 @@ type Metrics struct {
 	RPCRequests      atomic.Uint64
 	RPCErrors        atomic.Uint64
 
+	// Execution Lanes (Feature #1)
+	LaneFastCount    atomic.Int64
+	LaneStdCount     atomic.Int64
+	LaneSlowCount    atomic.Int64
+	LaneFastGas      atomic.Uint64
+	LaneStdGas       atomic.Uint64
+	LaneSlowGas      atomic.Uint64
+
+	// Adaptive Block Sizing (Feature #4)
+	AdaptiveGasLimit    atomic.Uint64
+	AdaptiveMaxTx       atomic.Int64
+	AdaptiveUtilization atomic.Int64 // stored as utilization * 10000 (basis points)
+
+	// Compute Receipts (Feature #10)
+	ReceiptsGenerated atomic.Uint64
+	ReceiptsStored    atomic.Uint64
+
 	logger log.Logger
 }
 
@@ -131,4 +148,39 @@ func (m *Metrics) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, "# HELP inso_sequencer_rpc_errors_total Total RPC errors\n")
 	fmt.Fprintf(w, "# TYPE inso_sequencer_rpc_errors_total counter\n")
 	fmt.Fprintf(w, "inso_sequencer_rpc_errors_total %d\n\n", m.RPCErrors.Load())
+
+	// Execution lane metrics
+	fmt.Fprintf(w, "# HELP inso_sequencer_lane_tx_count Current transactions per execution lane\n")
+	fmt.Fprintf(w, "# TYPE inso_sequencer_lane_tx_count gauge\n")
+	fmt.Fprintf(w, "inso_sequencer_lane_tx_count{lane=\"fast\"} %d\n", m.LaneFastCount.Load())
+	fmt.Fprintf(w, "inso_sequencer_lane_tx_count{lane=\"standard\"} %d\n", m.LaneStdCount.Load())
+	fmt.Fprintf(w, "inso_sequencer_lane_tx_count{lane=\"slow\"} %d\n\n", m.LaneSlowCount.Load())
+
+	fmt.Fprintf(w, "# HELP inso_sequencer_lane_gas_total Cumulative gas processed per lane\n")
+	fmt.Fprintf(w, "# TYPE inso_sequencer_lane_gas_total counter\n")
+	fmt.Fprintf(w, "inso_sequencer_lane_gas_total{lane=\"fast\"} %d\n", m.LaneFastGas.Load())
+	fmt.Fprintf(w, "inso_sequencer_lane_gas_total{lane=\"standard\"} %d\n", m.LaneStdGas.Load())
+	fmt.Fprintf(w, "inso_sequencer_lane_gas_total{lane=\"slow\"} %d\n\n", m.LaneSlowGas.Load())
+
+	// Adaptive block sizing metrics
+	fmt.Fprintf(w, "# HELP inso_sequencer_adaptive_gas_limit Current dynamic gas limit\n")
+	fmt.Fprintf(w, "# TYPE inso_sequencer_adaptive_gas_limit gauge\n")
+	fmt.Fprintf(w, "inso_sequencer_adaptive_gas_limit %d\n\n", m.AdaptiveGasLimit.Load())
+
+	fmt.Fprintf(w, "# HELP inso_sequencer_adaptive_max_tx Current max transactions per block\n")
+	fmt.Fprintf(w, "# TYPE inso_sequencer_adaptive_max_tx gauge\n")
+	fmt.Fprintf(w, "inso_sequencer_adaptive_max_tx %d\n\n", m.AdaptiveMaxTx.Load())
+
+	fmt.Fprintf(w, "# HELP inso_sequencer_adaptive_utilization_bps Gas utilization EMA in basis points (0-10000)\n")
+	fmt.Fprintf(w, "# TYPE inso_sequencer_adaptive_utilization_bps gauge\n")
+	fmt.Fprintf(w, "inso_sequencer_adaptive_utilization_bps %d\n\n", m.AdaptiveUtilization.Load())
+
+	// Compute receipt metrics
+	fmt.Fprintf(w, "# HELP inso_sequencer_receipts_generated_total Total compute receipts generated\n")
+	fmt.Fprintf(w, "# TYPE inso_sequencer_receipts_generated_total counter\n")
+	fmt.Fprintf(w, "inso_sequencer_receipts_generated_total %d\n\n", m.ReceiptsGenerated.Load())
+
+	fmt.Fprintf(w, "# HELP inso_sequencer_receipts_stored Total compute receipts in store\n")
+	fmt.Fprintf(w, "# TYPE inso_sequencer_receipts_stored gauge\n")
+	fmt.Fprintf(w, "inso_sequencer_receipts_stored %d\n\n", m.ReceiptsStored.Load())
 }

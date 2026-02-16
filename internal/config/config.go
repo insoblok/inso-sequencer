@@ -10,13 +10,14 @@ import (
 
 // Config is the top-level sequencer configuration.
 type Config struct {
-	Sequencer   SequencerConfig   `yaml:"sequencer"`
-	L1          L1Config          `yaml:"l1"`
-	TasteScore  TasteScoreConfig  `yaml:"tastescore"`
-	DID         DIDConfig         `yaml:"did"`
-	Sovereignty SovereigntyConfig `yaml:"sovereignty"`
-	Logging     LoggingConfig     `yaml:"logging"`
-	Metrics     MetricsConfig     `yaml:"metrics"`
+	Sequencer     SequencerConfig     `yaml:"sequencer"`
+	L1            L1Config            `yaml:"l1"`
+	TasteScore    TasteScoreConfig    `yaml:"tastescore"`
+	DID           DIDConfig           `yaml:"did"`
+	Sovereignty   SovereigntyConfig   `yaml:"sovereignty"`
+	AdaptiveBlock AdaptiveBlockConfig `yaml:"adaptive_block"`
+	Logging       LoggingConfig       `yaml:"logging"`
+	Metrics       MetricsConfig       `yaml:"metrics"`
 }
 
 // SequencerConfig holds the core sequencer settings.
@@ -75,6 +76,18 @@ type SovereigntyConfig struct {
 	FeeDiscounts   bool   `yaml:"fee_discounts"`    // Enable sovereignty-based fee discounts
 }
 
+// AdaptiveBlockConfig holds adaptive block sizing parameters (Feature #4).
+type AdaptiveBlockConfig struct {
+	Enabled           bool    `yaml:"enabled"`
+	MinGasLimit       uint64  `yaml:"min_gas_limit"`
+	MaxGasLimit       uint64  `yaml:"max_gas_limit"`
+	MinMaxTx          int     `yaml:"min_max_tx"`
+	MaxMaxTx          int     `yaml:"max_max_tx"`
+	Alpha             float64 `yaml:"alpha"`              // EMA smoothing factor
+	TargetUtilization float64 `yaml:"target_utilization"` // Target gas utilization
+	AdjustStepBps     uint64  `yaml:"adjust_step_bps"`    // Adjustment step in basis points
+}
+
 // Load reads and parses a YAML config file.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -122,6 +135,16 @@ func DefaultConfig() *Config {
 		Sovereignty: SovereigntyConfig{
 			Enabled:      true,
 			FeeDiscounts: true,
+		},
+		AdaptiveBlock: AdaptiveBlockConfig{
+			Enabled:           true,
+			MinGasLimit:       15_000_000,
+			MaxGasLimit:       60_000_000,
+			MinMaxTx:          1_000,
+			MaxMaxTx:          10_000,
+			Alpha:             0.2,
+			TargetUtilization: 0.5,
+			AdjustStepBps:     500,
 		},
 		Logging: LoggingConfig{
 			Level:  "info",

@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 
 	"github.com/insoblok/inso-sequencer/internal/config"
+	"github.com/insoblok/inso-sequencer/internal/metrics"
 	"github.com/insoblok/inso-sequencer/internal/state"
 	insoTypes "github.com/insoblok/inso-sequencer/pkg/types"
 )
@@ -109,6 +110,7 @@ type Batcher struct {
 	cfg            *config.L1Config
 	state          *state.Manager
 	l1Client       L1Client
+	metrics        *metrics.Metrics
 	logger         log.Logger
 	lastBatchBlock uint64
 	batchIndex     uint64
@@ -130,6 +132,9 @@ func New(cfg *config.L1Config, sm *state.Manager, l1Client L1Client, chainID uin
 		pendingBatches: make(map[common.Hash]*insoTypes.Batch),
 	}
 }
+
+// SetMetrics attaches the Prometheus metrics instance.
+func (b *Batcher) SetMetrics(m *metrics.Metrics) { b.metrics = m }
 
 // Start begins the batch submission loop.
 func (b *Batcher) Start(ctx context.Context) {
@@ -250,6 +255,12 @@ func (b *Batcher) submitBatch(ctx context.Context) {
 		"l1TxHash", txHash.Hex()[:16],
 		"sizeBytes", batch.SizeBytes,
 	)
+
+	// Update Prometheus metrics
+	if b.metrics != nil {
+		b.metrics.BatchesSubmitted.Add(1)
+		b.metrics.LastBatchSize.Store(int64(batch.SizeBytes))
+	}
 }
 
 // buildBatchFrame collects block data from the state manager into an RLP frame.

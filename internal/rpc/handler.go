@@ -14,24 +14,31 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 
+	"github.com/insoblok/inso-sequencer/internal/execution"
 	"github.com/insoblok/inso-sequencer/internal/fees"
 	"github.com/insoblok/inso-sequencer/internal/mempool"
+	"github.com/insoblok/inso-sequencer/internal/metrics"
+	"github.com/insoblok/inso-sequencer/internal/producer"
 	"github.com/insoblok/inso-sequencer/internal/state"
 	"github.com/insoblok/inso-sequencer/internal/tastescore"
 )
 
 // Handler dispatches JSON-RPC methods to their implementations.
 type Handler struct {
-	mempool    *mempool.Mempool
-	state      *state.Manager
-	tastescore *tastescore.Client
-	feeModel   *fees.DynamicFeeModel
-	chainID    *big.Int
-	logger     log.Logger
+	mempool      mempool.TxPool
+	state        *state.Manager
+	tastescore   *tastescore.Client
+	feeModel     *fees.DynamicFeeModel
+	receiptStore *execution.ReceiptStore
+	lanedPool    *mempool.LanedMempool
+	sizer        *producer.AdaptiveBlockSizer
+	metrics      *metrics.Metrics
+	chainID      *big.Int
+	logger       log.Logger
 }
 
 // NewHandler creates a new JSON-RPC handler.
-func NewHandler(mp *mempool.Mempool, sm *state.Manager, ts *tastescore.Client, chainID uint64, fm *fees.DynamicFeeModel) *Handler {
+func NewHandler(mp mempool.TxPool, sm *state.Manager, ts *tastescore.Client, chainID uint64, fm *fees.DynamicFeeModel) *Handler {
 	return &Handler{
 		mempool:    mp,
 		state:      sm,
@@ -42,9 +49,26 @@ func NewHandler(mp *mempool.Mempool, sm *state.Manager, ts *tastescore.Client, c
 	}
 }
 
+// SetReceiptStore attaches the verifiable compute receipt store.
+func (h *Handler) SetReceiptStore(rs *execution.ReceiptStore) { h.receiptStore = rs }
+
+// SetLanedPool attaches the laned mempool for lane-specific stats.
+func (h *Handler) SetLanedPool(lp *mempool.LanedMempool) { h.lanedPool = lp }
+
+// SetAdaptiveSizer attaches the adaptive block sizer for stats.
+func (h *Handler) SetAdaptiveSizer(s *producer.AdaptiveBlockSizer) { h.sizer = s }
+
+// SetMetrics attaches the Prometheus metrics instance.
+func (h *Handler) SetMetrics(m *metrics.Metrics) { h.metrics = m }
+
 // Handle processes a single JSON-RPC request and returns a response.
 func (h *Handler) Handle(ctx context.Context, req *JSONRPCRequest) *JSONRPCResponse {
 	h.logger.Debug("RPC request", "method", req.Method, "id", req.ID)
+
+	// Track RPC requests
+	if h.metrics != nil {
+		h.metrics.RPCRequests.Add(1)
+	}
 
 	var result interface{}
 	var err error
@@ -100,6 +124,16 @@ func (h *Handler) Handle(ctx context.Context, req *JSONRPCRequest) *JSONRPCRespo
 	case "inso_getSovereigntyDiscount":
 		result, err = h.getSovereigntyDiscount(req.Params)
 
+	// Phase 5: new InSoBlok feature endpoints
+	case "inso_getComputeReceipt":
+		result, err = h.getComputeReceipt(req.Params)
+	case "inso_getBlockReceiptRoot":
+		result, err = h.getBlockReceiptRoot(req.Params)
+	case "inso_getLaneStats":
+		result = h.getLaneStats()
+	case "inso_getAdaptiveBlockStats":
+		result = h.getAdaptiveBlockStats()
+
 	default:
 		return &JSONRPCResponse{
 			JSONRPC: "2.0",
@@ -109,6 +143,10 @@ func (h *Handler) Handle(ctx context.Context, req *JSONRPCRequest) *JSONRPCRespo
 	}
 
 	if err != nil {
+		// Track RPC errors
+		if h.metrics != nil {
+			h.metrics.RPCErrors.Add(1)
+		}
 		return &JSONRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
@@ -572,4 +610,86 @@ func (h *Handler) getSovereigntyDiscount(params json.RawMessage) (interface{}, e
 		"tier":        tier,
 		"tierName":    tierName,
 	}, nil
+}
+
+// --- Phase 5: New Feature Endpoints ---
+
+// getComputeReceipt returns the verifiable compute receipt for a transaction.
+func (h *Handler) getComputeReceipt(params json.RawMessage) (interface{}, error) {
+	if h.receiptStore == nil {
+		return nil, fmt.Errorf("compute receipts not enabled")
+	}
+	var args []string
+	if err := json.Unmarshal(params, &args); err != nil || len(args) == 0 {
+		return nil, fmt.Errorf("invalid params: need [txHash]")
+	}
+	hash := common.HexToHash(args[0])
+	cr := h.receiptStore.Get(hash)
+	if cr == nil {
+		return nil, nil
+	}
+	return map[string]interface{}{
+		"txHash":        cr.TxHash.Hex(),
+		"blockNumber":   cr.BlockNumber,
+		"txIndex":       cr.TxIndex,
+		"sender":        cr.Sender.Hex(),
+		"gasUsed":       cr.GasUsed,
+		"status":        cr.Status,
+		"preStateRoot":  cr.PreStateRoot.Hex(),
+		"postStateRoot": cr.PostStateRoot.Hex(),
+		"inputHash":     cr.InputHash.Hex(),
+		"outputHash":    cr.OutputHash.Hex(),
+		"logsHash":      cr.LogsHash.Hex(),
+		"receiptHash":   cr.ReceiptHash.Hex(),
+		"verified":      cr.Verify(),
+	}, nil
+}
+
+// getBlockReceiptRoot returns the Merkle root of all compute receipts in a block.
+func (h *Handler) getBlockReceiptRoot(params json.RawMessage) (interface{}, error) {
+	if h.receiptStore == nil {
+		return nil, fmt.Errorf("compute receipts not enabled")
+	}
+	var args []string
+	if err := json.Unmarshal(params, &args); err != nil || len(args) == 0 {
+		return nil, fmt.Errorf("invalid params: need [blockNumber]")
+	}
+	blockNum, err := hexutil.DecodeUint64(args[0])
+	if err != nil {
+		return nil, fmt.Errorf("invalid block number: %w", err)
+	}
+	root := h.receiptStore.ComputeBlockReceiptRoot(blockNum)
+	return map[string]interface{}{
+		"blockNumber": blockNum,
+		"receiptRoot": root.Hex(),
+	}, nil
+}
+
+// getLaneStats returns the current execution lane statistics.
+func (h *Handler) getLaneStats() interface{} {
+	if h.lanedPool == nil {
+		return map[string]interface{}{"enabled": false}
+	}
+	fast, std, slow := h.lanedPool.LaneSizes()
+	return map[string]interface{}{
+		"enabled":  true,
+		"fast":     fast,
+		"standard": std,
+		"slow":     slow,
+		"total":    fast + std + slow,
+	}
+}
+
+// getAdaptiveBlockStats returns current adaptive block sizing statistics.
+func (h *Handler) getAdaptiveBlockStats() interface{} {
+	if h.sizer == nil {
+		return map[string]interface{}{"enabled": false}
+	}
+	gasLimit, maxTx, utilization := h.sizer.Stats()
+	return map[string]interface{}{
+		"enabled":         true,
+		"currentGasLimit": gasLimit,
+		"currentMaxTx":    maxTx,
+		"utilization":     utilization,
+	}
 }
