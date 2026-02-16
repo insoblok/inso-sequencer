@@ -148,7 +148,12 @@ func (e *EVMExecutor) applyTransaction(
 	// Deduct gas upfront
 	gasCostU256, _ := uint256.FromBig(gasCost)
 	stateDB.SubBalance(sender, gasCostU256, tracing.BalanceDecreaseGasBuy)
-	stateDB.SetNonce(sender, stateNonce+1)
+
+	// For message calls, we increment nonce here.
+	// For contract creation, evm.Create() bumps nonce internally.
+	if tx.To() != nil {
+		stateDB.SetNonce(sender, stateNonce+1)
+	}
 
 	var (
 		gasUsed   uint64
@@ -219,8 +224,11 @@ func (e *EVMExecutor) applyTransaction(
 		receipt.ContractAddress = crypto.CreateAddress(sender, tx.Nonce())
 	}
 
-	// Collect logs
+	// Collect logs (must be non-nil for JSON roundtrip)
 	receipt.Logs = stateDB.GetLogs(tx.Hash(), blockCtx.BlockNumber.Uint64(), common.Hash{})
+	if receipt.Logs == nil {
+		receipt.Logs = []*types.Log{}
+	}
 
 	// Create bloom filter from logs
 	receipt.Bloom = types.CreateBloom(types.Receipts{receipt})
@@ -283,6 +291,35 @@ func (e *EVMExecutor) EstimateGas(
 	if msg.To == nil {
 		// Contract creation has higher intrinsic cost
 		lo = 53000
+	}
+
+	// First check: does the tx succeed at the upper bound?
+	msgCheck := *msg
+	msgCheck.GasLimit = hi
+	snap := stateDB.Snapshot()
+	_, gasUsedAtMax, errMax := e.CallContract(stateDB, &msgCheck, blockCtx)
+	stateDB.RevertToSnapshot(snap)
+
+	if errMax != nil {
+		// If it fails even with max gas, return a reasonable default
+		// with 20% headroom above the gas already used, but not more than block limit
+		e.logger.Warn("EstimateGas: call failed even at max gas",
+			"maxGas", hi,
+			"error", errMax,
+		)
+		// If the call used some gas before failing, estimate from that
+		if gasUsedAtMax > 0 {
+			estimate := gasUsedAtMax * 120 / 100
+			if estimate > hi {
+				estimate = hi
+			}
+			return estimate, nil
+		}
+		// Default: return a moderate estimate for contract creation
+		if msg.To == nil {
+			return 3_000_000, nil
+		}
+		return 100_000, nil
 	}
 
 	for lo+1 < hi {

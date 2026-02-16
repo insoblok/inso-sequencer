@@ -159,12 +159,14 @@ func (lm *LanedMempool) PopBatchLaned(maxTx int, gasLimit uint64) []*insoTypes.T
 	// Phase 2: Fill remaining gas from any lane (fast first)
 	remaining := gasLimit - totalGas
 	if remaining > 0 && len(batch) < maxTx {
-		extra, _ := lm.drainLane(&lm.fast, maxTx-len(batch), remaining)
+		extra, extraUsed := lm.drainLane(&lm.fast, maxTx-len(batch), remaining)
 		batch = append(batch, extra...)
+		remaining -= extraUsed
 	}
 	if remaining > 0 && len(batch) < maxTx {
-		extra, _ := lm.drainLane(&lm.std, maxTx-len(batch), remaining)
+		extra, extraUsed := lm.drainLane(&lm.std, maxTx-len(batch), remaining)
 		batch = append(batch, extra...)
+		remaining -= extraUsed
 	}
 	if remaining > 0 && len(batch) < maxTx {
 		extra, _ := lm.drainLane(&lm.slow, maxTx-len(batch), remaining)

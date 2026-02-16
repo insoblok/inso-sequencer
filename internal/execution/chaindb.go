@@ -19,7 +19,7 @@ import (
 var (
 	prefixBlock      = []byte("b")  // b + blockNum -> L2Block (JSON)
 	prefixBlockHash  = []byte("h")  // h + hash -> blockNum (big-endian uint64)
-	prefixReceipt    = []byte("r")  // r + txHash -> Receipt (RLP)
+	prefixReceipt    = []byte("r")  // r + txHash -> Receipt (JSON)
 	prefixTx         = []byte("t")  // t + txHash -> Transaction (RLP)
 	prefixTxBlock    = []byte("tb") // tb + txHash -> blockNum (big-endian uint64)
 	prefixBatch      = []byte("bt") // bt + batchIndex -> Batch (JSON)
@@ -95,13 +95,13 @@ func (c *ChainDB) WriteBlock(block *insoTypes.L2Block) error {
 		batch.Put(append(prefixTxBlock, tx.Hash().Bytes()...), numBytes)
 	}
 
-	// Index receipts
+	// Index receipts (JSON to preserve metadata fields like TxHash, BlockHash, etc.)
 	for _, receipt := range block.Receipts {
-		rcptRLP, err := rlp.EncodeToBytes(receipt)
+		rcptJSON, err := json.Marshal(receipt)
 		if err != nil {
 			return fmt.Errorf("encode receipt %s: %w", receipt.TxHash.Hex(), err)
 		}
-		batch.Put(append(prefixReceipt, receipt.TxHash.Bytes()...), rcptRLP)
+		batch.Put(append(prefixReceipt, receipt.TxHash.Bytes()...), rcptJSON)
 	}
 
 	// Update current block number
@@ -134,6 +134,7 @@ func (c *ChainDB) ReadBlock(num uint64) (*insoTypes.L2Block, error) {
 
 	var block insoTypes.L2Block
 	if err := json.Unmarshal(data, &block); err != nil {
+		c.logger.Error("Block unmarshal failed", "block", num, "dataLen", len(data), "err", err)
 		return nil, fmt.Errorf("unmarshal block %d: %w", num, err)
 	}
 	return &block, nil
@@ -201,8 +202,11 @@ func (c *ChainDB) ReadReceipt(txHash common.Hash) (*types.Receipt, error) {
 	}
 
 	var receipt types.Receipt
-	if err := rlp.DecodeBytes(data, &receipt); err != nil {
-		return nil, fmt.Errorf("decode receipt: %w", err)
+	if err := json.Unmarshal(data, &receipt); err != nil {
+		// Fallback: try RLP for legacy data
+		if rlpErr := rlp.DecodeBytes(data, &receipt); rlpErr != nil {
+			return nil, fmt.Errorf("decode receipt: %w", err)
+		}
 	}
 	return &receipt, nil
 }

@@ -3,6 +3,7 @@ package state
 import (
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
@@ -152,13 +153,19 @@ func (m *Manager) GetLatestStateRoot() common.Hash {
 
 // GetBlock returns a block by number.
 func (m *Manager) GetBlock(num uint64) *insoTypes.L2Block {
-	block, _ := m.chainDB.ReadBlock(num)
+	block, err := m.chainDB.ReadBlock(num)
+	if err != nil {
+		log.Error("Failed to read block", "number", num, "err", err)
+	}
 	return block
 }
 
 // GetBlockByHash returns a block by its hash.
 func (m *Manager) GetBlockByHash(hash common.Hash) *insoTypes.L2Block {
-	block, _ := m.chainDB.ReadBlockByHash(hash)
+	block, err := m.chainDB.ReadBlockByHash(hash)
+	if err != nil {
+		log.Error("Failed to read block by hash", "hash", hash.Hex(), "err", err)
+	}
 	return block
 }
 
@@ -177,6 +184,11 @@ func (m *Manager) GetTransaction(hash common.Hash) *types.Transaction {
 func (m *Manager) GetReceipt(hash common.Hash) *types.Receipt {
 	receipt, _ := m.chainDB.ReadReceipt(hash)
 	return receipt
+}
+
+// GetTxBlockNumber returns the block number containing a given transaction.
+func (m *Manager) GetTxBlockNumber(hash common.Hash) (uint64, bool) {
+	return m.chainDB.ReadTxBlockNumber(hash)
 }
 
 // GetBalance returns the balance for an address from current state.
@@ -277,9 +289,10 @@ func (m *Manager) ExecuteAndCommitBlock(
 	// Build receipts slice
 	receipts := make([]*types.Receipt, 0, len(results))
 	executedTxs := make([]*types.Transaction, 0, len(results))
-	for _, r := range results {
+	for i, r := range results {
 		r.Receipt.BlockHash = blockHash
 		r.Receipt.BlockNumber = new(big.Int).SetUint64(blockNum)
+		r.Receipt.TransactionIndex = uint(i)
 		receipts = append(receipts, r.Receipt)
 		// Find the corresponding tx
 		for _, tx := range txs {
@@ -361,9 +374,10 @@ func (m *Manager) buildBlockContext(blockNum uint64) vm.BlockContext {
 		},
 		Coinbase:    m.sequencerAddr,
 		BlockNumber: new(big.Int).SetUint64(blockNum),
-		Time:        uint64(0), // caller fills in
+		Time:        uint64(time.Now().Unix()),
 		GasLimit:    30_000_000,
 		BaseFee:     big.NewInt(1_000_000_000),
+		Random:      &common.Hash{}, // PoS: signals post-merge for Shanghai/Cancun opcodes
 	}
 }
 

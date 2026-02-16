@@ -21,6 +21,7 @@ import (
 	"github.com/insoblok/inso-sequencer/internal/producer"
 	"github.com/insoblok/inso-sequencer/internal/state"
 	"github.com/insoblok/inso-sequencer/internal/tastescore"
+	insoTypes "github.com/insoblok/inso-sequencer/pkg/types"
 )
 
 // Handler dispatches JSON-RPC methods to their implementations.
@@ -105,6 +106,10 @@ func (h *Handler) Handle(ctx context.Context, req *JSONRPCRequest) *JSONRPCRespo
 		result, err = h.getStorageAt(req.Params)
 	case "eth_getLogs":
 		result, err = h.getLogs(req.Params)
+	case "eth_feeHistory":
+		result = h.feeHistory(req.Params)
+	case "eth_maxPriorityFeePerGas":
+		result = hexutil.EncodeBig(big.NewInt(1000000000)) // 1 Gwei tip
 	case "net_version":
 		result = fmt.Sprintf("%d", h.chainID.Uint64())
 
@@ -224,11 +229,17 @@ func (h *Handler) getBlockByNumber(params json.RawMessage) (interface{}, error) 
 		blockNum = n
 	}
 
-	block := h.state.GetBlock(blockNum)
+   block := h.state.GetBlock(blockNum)
 	if block == nil {
 		return nil, nil
 	}
-	return block, nil
+
+	// second arg: fullTx flag
+	fullTx := false
+	if len(args) > 1 {
+		_ = json.Unmarshal(args[1], &fullTx)
+	}
+	return ethBlockResponse(block, fullTx), nil
 }
 
 func (h *Handler) getBlockByHash(params json.RawMessage) (interface{}, error) {
@@ -247,7 +258,12 @@ func (h *Handler) getBlockByHash(params json.RawMessage) (interface{}, error) {
 	if block == nil {
 		return nil, nil
 	}
-	return block, nil
+
+	fullTx := false
+	if len(args) > 1 {
+		_ = json.Unmarshal(args[1], &fullTx)
+	}
+	return ethBlockResponse(block, fullTx), nil
 }
 
 func (h *Handler) getTransactionReceipt(params json.RawMessage) (interface{}, error) {
@@ -258,7 +274,49 @@ func (h *Handler) getTransactionReceipt(params json.RawMessage) (interface{}, er
 
 	hash := common.HexToHash(args[0])
 	receipt := h.state.GetReceipt(hash)
-	return receipt, nil
+	if receipt == nil {
+		return nil, nil
+	}
+
+	// Build Ethereum-compatible receipt response
+	resp := map[string]interface{}{
+		"transactionHash":   receipt.TxHash,
+		"transactionIndex":  hexutil.Uint64(receipt.TransactionIndex),
+		"blockHash":         receipt.BlockHash,
+		"blockNumber":       hexutil.Uint64(receipt.BlockNumber.Uint64()),
+		"from":              common.Address{}, // filled below
+		"gasUsed":           hexutil.Uint64(receipt.GasUsed),
+		"cumulativeGasUsed": hexutil.Uint64(receipt.CumulativeGasUsed),
+		"status":            hexutil.Uint64(receipt.Status),
+		"logsBloom":         receipt.Bloom,
+		"type":              hexutil.Uint64(receipt.Type),
+		"effectiveGasPrice": hexutil.EncodeBig(h.feeModel.BaseFee()),
+	}
+
+	if receipt.ContractAddress != (common.Address{}) {
+		resp["contractAddress"] = receipt.ContractAddress
+	} else {
+		resp["contractAddress"] = nil
+	}
+
+	if receipt.Logs != nil {
+		resp["logs"] = receipt.Logs
+	} else {
+		resp["logs"] = []*types.Log{}
+	}
+
+	// Resolve sender from the stored transaction
+	tx := h.state.GetTransaction(hash)
+	if tx != nil {
+		signer := types.LatestSignerForChainID(h.chainID)
+		sender, err := types.Sender(signer, tx)
+		if err == nil {
+			resp["from"] = sender
+		}
+		resp["to"] = tx.To()
+	}
+
+	return resp, nil
 }
 
 func (h *Handler) getTransactionByHash(params json.RawMessage) (interface{}, error) {
@@ -269,7 +327,56 @@ func (h *Handler) getTransactionByHash(params json.RawMessage) (interface{}, err
 
 	hash := common.HexToHash(args[0])
 	tx := h.state.GetTransaction(hash)
-	return tx, nil
+	if tx == nil {
+		return nil, nil
+	}
+
+	// Resolve block context
+	blockNum, found := h.state.GetTxBlockNumber(hash)
+
+	signer := types.LatestSignerForChainID(h.chainID)
+	sender, _ := types.Sender(signer, tx)
+
+	resp := map[string]interface{}{
+		"hash":     tx.Hash(),
+		"nonce":    hexutil.Uint64(tx.Nonce()),
+		"from":     sender,
+		"to":       tx.To(),
+		"value":    hexutil.EncodeBig(tx.Value()),
+		"gas":      hexutil.Uint64(tx.Gas()),
+		"gasPrice": hexutil.EncodeBig(tx.GasPrice()),
+		"input":    hexutil.Encode(tx.Data()),
+		"type":     hexutil.Uint64(tx.Type()),
+		"chainId":  hexutil.EncodeBig(tx.ChainId()),
+		"v":        "0x0",
+		"r":        "0x0",
+		"s":        "0x0",
+	}
+
+	if found {
+		resp["blockNumber"] = hexutil.Uint64(blockNum)
+		blockHash := h.state.GetBlockHash(blockNum)
+		resp["blockHash"] = blockHash
+		resp["transactionIndex"] = hexutil.Uint64(0)
+	} else {
+		resp["blockNumber"] = nil
+		resp["blockHash"] = nil
+		resp["transactionIndex"] = nil
+	}
+
+	// Extract V, R, S from signature
+	v, r, s := tx.RawSignatureValues()
+	if v != nil {
+		resp["v"] = hexutil.EncodeBig(v)
+	}
+	if r != nil {
+		resp["r"] = hexutil.EncodeBig(r)
+	}
+	if s != nil {
+		resp["s"] = hexutil.EncodeBig(s)
+	}
+
+	return resp, nil
 }
 
 func (h *Handler) getBalance(params json.RawMessage) (interface{}, error) {
@@ -680,6 +787,56 @@ func (h *Handler) getLaneStats() interface{} {
 	}
 }
 
+// ethBlockResponse converts an L2Block to a flat Ethereum-compatible JSON
+// response so that standard tooling (Foundry, MetaMask, ethers.js, etc.)
+// can parse block replies.
+func ethBlockResponse(block *insoTypes.L2Block, fullTx bool) map[string]interface{} {
+	hdr := block.Header
+
+	txs := make([]interface{}, 0, len(block.Transactions))
+	for i, tx := range block.Transactions {
+		if fullTx {
+			txs = append(txs, tx)
+		} else {
+			if tx != nil {
+				txs = append(txs, tx.Hash())
+			} else {
+				txs = append(txs, common.Hash{})
+			}
+			_ = i
+		}
+	}
+
+	baseFee := hexutil.Big(*big.NewInt(0))
+	if hdr.BaseFee != nil {
+		baseFee = hexutil.Big(*hdr.BaseFee)
+	}
+
+	return map[string]interface{}{
+		"number":           hexutil.Uint64(hdr.Number),
+		"hash":             hdr.Hash,
+		"parentHash":       hdr.ParentHash,
+		"timestamp":        hexutil.Uint64(hdr.Timestamp),
+		"stateRoot":        hdr.StateRoot,
+		"gasUsed":          hexutil.Uint64(hdr.GasUsed),
+		"gasLimit":         hexutil.Uint64(hdr.GasLimit),
+		"baseFeePerGas":    &baseFee,
+		"miner":            hdr.SequencerAddr,
+		"transactions":     txs,
+		"transactionsRoot": common.Hash{},
+		"receiptsRoot":     common.Hash{},
+		"logsBloom":        "0x" + common.Bytes2Hex(make([]byte, 256)),
+		"difficulty":       hexutil.Uint64(0),
+		"totalDifficulty":  hexutil.Uint64(0),
+		"size":             hexutil.Uint64(0),
+		"extraData":        "0x",
+		"nonce":            "0x0000000000000000",
+		"sha3Uncles":       common.HexToHash("0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
+		"uncles":           []common.Hash{},
+		"mixHash":          common.Hash{},
+	}
+}
+
 // getAdaptiveBlockStats returns current adaptive block sizing statistics.
 func (h *Handler) getAdaptiveBlockStats() interface{} {
 	if h.sizer == nil {
@@ -691,5 +848,36 @@ func (h *Handler) getAdaptiveBlockStats() interface{} {
 		"currentGasLimit": gasLimit,
 		"currentMaxTx":    maxTx,
 		"utilization":     utilization,
+	}
+}
+
+// feeHistory returns an EIP-1559 fee-history response.
+// We return a minimal response since InSoBlok uses its own dynamic fee model.
+func (h *Handler) feeHistory(params json.RawMessage) interface{} {
+	blockCount := 1
+	var args []json.RawMessage
+	if err := json.Unmarshal(params, &args); err == nil && len(args) > 0 {
+		var bc int
+		if err := json.Unmarshal(args[0], &bc); err == nil && bc > 0 {
+			blockCount = bc
+		}
+	}
+	if blockCount > 1024 {
+		blockCount = 1024
+	}
+
+	baseFee := h.feeModel.BaseFee()
+	baseFees := make([]string, blockCount+1)
+	gasUsedRatios := make([]float64, blockCount)
+	for i := 0; i < blockCount; i++ {
+		baseFees[i] = hexutil.EncodeBig(baseFee)
+		gasUsedRatios[i] = 0.0
+	}
+	baseFees[blockCount] = hexutil.EncodeBig(baseFee)
+
+	return map[string]interface{}{
+		"oldestBlock":   hexutil.Uint64(h.state.CurrentBlock()),
+		"baseFeePerGas": baseFees,
+		"gasUsedRatio":  gasUsedRatios,
 	}
 }
