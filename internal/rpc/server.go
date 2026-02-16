@@ -20,6 +20,7 @@ type Server struct {
 	httpServer *http.Server
 	wsServer   *http.Server
 	handler    *Handler
+	wsMgr      *WSSubscriptionManager
 	logger     log.Logger
 	cfg        *config.SequencerConfig
 }
@@ -28,9 +29,15 @@ type Server struct {
 func NewServer(cfg *config.SequencerConfig, handler *Handler) *Server {
 	return &Server{
 		handler: handler,
+		wsMgr:   NewWSSubscriptionManager(handler),
 		logger:  log.New("module", "rpc"),
 		cfg:     cfg,
 	}
+}
+
+// WSManager returns the WebSocket subscription manager for event broadcasting.
+func (s *Server) WSManager() *WSSubscriptionManager {
+	return s.wsMgr
 }
 
 // Start begins listening for JSON-RPC requests on HTTP and WebSocket.
@@ -133,9 +140,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleWS handles WebSocket connections (upgrade + message loop).
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	// WebSocket upgrade and message loop would use gorilla/websocket or nhooyr.io/websocket.
-	// For now, fall back to HTTP long-polling style.
-	s.handleHTTP(w, r)
+	s.wsMgr.HandleWS(w, r)
 }
 
 // handleHealth returns a liveness check response.
