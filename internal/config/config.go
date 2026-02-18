@@ -45,6 +45,8 @@ type TasteScoreConfig struct {
 	Enabled        bool          `yaml:"enabled"`
 	APIURL         string        `yaml:"api_url"`
 	APIKey         string        `yaml:"api_key"`
+	APIVersion     string        `yaml:"api_version"`
+	Chains         []string      `yaml:"chains"`
 	OrderingWeight float64       `yaml:"ordering_weight"`
 	CacheTTL       time.Duration `yaml:"cache_ttl"`
 }
@@ -126,6 +128,8 @@ func DefaultConfig() *Config {
 		TasteScore: TasteScoreConfig{
 			Enabled:        true,
 			APIURL:         "https://api.insoblokai.io",
+			APIVersion:     "v2",
+			Chains:         []string{"ethereum", "base", "arbitrum", "inso"},
 			OrderingWeight: 0.3,
 			CacheTTL:       60 * time.Second,
 		},

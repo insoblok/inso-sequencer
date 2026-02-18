@@ -209,10 +209,12 @@ func (h *Handler) sendRawTransaction(ctx context.Context, params json.RawMessage
 		return nil, fmt.Errorf("invalid sender: %w", err)
 	}
 
-	// Get TasteScore for sender
+	// Get TasteScore for sender (V2: confidence-weighted)
 	var score float64
 	if h.tastescore != nil {
-		score, _ = h.tastescore.GetScore(ctx, sender)
+		if result, err := h.tastescore.GetScoreResult(ctx, sender); err == nil {
+			score = h.tastescore.EffectiveScore(result)
+		}
 	}
 
 	// Add to mempool
@@ -426,22 +428,34 @@ func (h *Handler) getSequencerStatus() interface{} {
 func (h *Handler) getTasteScoreOrdering() interface{} {
 	pending := h.mempool.Pending()
 	type entry struct {
-		TxHash     string  `json:"txHash"`
-		Sender     string  `json:"sender"`
-		TasteScore float64 `json:"tasteScore"`
-		Priority   float64 `json:"priority"`
-		GasPrice   string  `json:"gasPrice"`
+		TxHash         string             `json:"txHash"`
+		Sender         string             `json:"sender"`
+		TasteScore     float64            `json:"tasteScore"`
+		Confidence     float64            `json:"confidence"`
+		Tier           string             `json:"tier"`
+		ChainBreakdown map[string]float64 `json:"chainBreakdown,omitempty"`
+		Priority       float64            `json:"priority"`
+		GasPrice       string             `json:"gasPrice"`
 	}
 
 	entries := make([]entry, 0, len(pending))
 	for _, meta := range pending {
-		entries = append(entries, entry{
+		e := entry{
 			TxHash:     meta.Tx.Hash().Hex(),
 			Sender:     meta.Sender.Hex(),
 			TasteScore: meta.TasteScore,
 			Priority:   meta.Priority,
 			GasPrice:   meta.GasPrice.String(),
-		})
+		}
+		// Enrich with V2 data if the tastescore client is available
+		if h.tastescore != nil {
+			if result, err := h.tastescore.GetScoreResult(context.Background(), meta.Sender); err == nil {
+				e.Confidence = result.Confidence
+				e.Tier = result.Tier
+				e.ChainBreakdown = result.ChainBreakdown
+			}
+		}
+		entries = append(entries, e)
 	}
 	return entries
 }
@@ -967,7 +981,7 @@ func (h *Handler) getOrderingProof(params json.RawMessage) (interface{}, error) 
 	}, nil
 }
 
-// getAIScorePreview returns a simulated AI TasteScore preview for an address.
+// getAIScorePreview returns the TasteScore V2 preview for an address.
 func (h *Handler) getAIScorePreview(params json.RawMessage) (interface{}, error) {
 	var args []json.RawMessage
 	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
@@ -979,24 +993,43 @@ func (h *Handler) getAIScorePreview(params json.RawMessage) (interface{}, error)
 	}
 	addr := common.HexToAddress(addrStr)
 
-	// Use on-chain taste score if available
+	// Use V2 taste score result if available
 	var score float64
+	var confidence float64
+	var tier string
+	var modelVersion string
+	var chainBreakdown map[string]float64
 	if h.tastescore != nil {
-		if s, err := h.tastescore.GetScore(context.Background(), addr); err == nil {
-			score = s
+		if result, err := h.tastescore.GetScoreResult(context.Background(), addr); err == nil {
+			score = result.CompositeScore
+			confidence = result.Confidence
+			tier = result.Tier
+			modelVersion = result.ModelVersion
+			chainBreakdown = result.ChainBreakdown
 		}
 	}
 	if score == 0 {
 		score = 0.5 // default mid-range
 	}
+	if confidence == 0 {
+		confidence = 0.0
+	}
+	if tier == "" {
+		tier = "Unscored"
+	}
+	if modelVersion == "" {
+		modelVersion = "tastescore-v2"
+	}
 
 	return map[string]interface{}{
-		"address":    addr.Hex(),
-		"tasteScore": score,
-		"aiModel":    "tastescore-v1",
-		"confidence": 0.85,
+		"address":        addr.Hex(),
+		"tasteScore":     score,
+		"confidence":     confidence,
+		"tier":           tier,
+		"aiModel":        modelVersion,
+		"chainBreakdown": chainBreakdown,
 		"factors": map[string]interface{}{
-			"txFrequency":  0.7,
+			"txFrequency":   0.7,
 			"gasEfficiency": 0.9,
 			"stakingScore":  0.6,
 		},

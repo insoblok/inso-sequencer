@@ -18,6 +18,8 @@ tastescore:
   enabled: true
   api_url: "https://api.insoblokai.io"
   api_key: "${TASTESCORE_API_KEY}"
+  api_version: "v2"
+  chains: ["ethereum", "base", "arbitrum", "inso"]
   ordering_weight: 0.3
   cache_ttl: 60s
 
