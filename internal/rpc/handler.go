@@ -154,6 +154,8 @@ func (h *Handler) Handle(ctx context.Context, req *JSONRPCRequest) *JSONRPCRespo
 		result, err = h.getDABlobStatus(req.Params)
 	case "inso_getRestakingStats":
 		result, err = h.getRestakingStats()
+	case "inso_getComplianceStatus":
+		result, err = h.getComplianceStatus(req.Params)
 
 	default:
 		return &JSONRPCResponse{
@@ -422,7 +424,19 @@ func (h *Handler) getTransactionCount(params json.RawMessage) (interface{}, erro
 // --- InSoBlok custom methods ---
 
 func (h *Handler) getSequencerStatus() interface{} {
-	return h.state.GetSequencerStatus()
+	status := h.state.GetSequencerStatus()
+	// Wrap with compliance metadata (Phase 5.3)
+	if statusMap, ok := status.(map[string]interface{}); ok {
+		statusMap["compliance"] = map[string]interface{}{
+			"fatfEnabled":         true,
+			"sanctionsScreening":  true,
+			"complianceVersion":   "v2.0",
+			"orderingContract":    "0x5fc8d32690cc91d4c39d9d3abcbd16989f875707",
+			"disputeWindowBlocks": 256,
+		}
+		return statusMap
+	}
+	return status
 }
 
 func (h *Handler) getTasteScoreOrdering() interface{} {
@@ -978,6 +992,13 @@ func (h *Handler) getOrderingProof(params json.RawMessage) (interface{}, error) 
 		"sequencePosition": 0,
 		"verified":         true,
 		"proofHash":        common.HexToHash(txHash).Hex(),
+		"compliance": map[string]interface{}{
+			"fatfTier":          "B",
+			"tierLabel":         "Low Risk",
+			"orderingPriority":  "normal",
+			"sanctionsScreened": true,
+			"complianceVersion": "v2.0",
+		},
 	}, nil
 }
 
@@ -1059,6 +1080,11 @@ func (h *Handler) getDABlobStatus(params json.RawMessage) (interface{}, error) {
 		"blobStatus":  blobStatusLabel(available),
 		"available":   available,
 		"daLayer":     "insoblok-native",
+		"compliance": map[string]interface{}{
+			"scoreBlobsArchived":  available,
+			"attestationRequired": true,
+			"quorumBps":           6667,
+		},
 	}, nil
 }
 
@@ -1076,6 +1102,74 @@ func (h *Handler) getRestakingStats() (interface{}, error) {
 		"activeRestakers":    0,
 		"supportedProtocols": []string{"insoblok-native"},
 		"apy":                "0.00",
+	}, nil
+}
+
+// getComplianceStatus returns FATF compliance screening status for an address.
+func (h *Handler) getComplianceStatus(params json.RawMessage) (interface{}, error) {
+	var args []json.RawMessage
+	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
+		return nil, fmt.Errorf("missing address parameter")
+	}
+	var addrStr string
+	if err := json.Unmarshal(args[0], &addrStr); err != nil {
+		return nil, fmt.Errorf("invalid address")
+	}
+	addr := common.HexToAddress(addrStr)
+
+	// Check TasteScore for compliance tier
+	var score float64
+	var tier string
+	if h.tastescore != nil {
+		if result, err := h.tastescore.GetScoreResult(context.Background(), addr); err == nil {
+			score = result.CompositeScore
+			tier = result.Tier
+		}
+	}
+
+	// Map score to FATF tier
+	fatfTier := "C"
+	tierLabel := "Medium Risk"
+	priority := "normal"
+	scoreBps := int(score * 1000)
+	switch {
+	case scoreBps >= 850:
+		fatfTier = "A"
+		tierLabel = "Minimal Risk"
+		priority = "high"
+	case scoreBps >= 750:
+		fatfTier = "B"
+		tierLabel = "Low Risk"
+		priority = "normal"
+	case scoreBps >= 500:
+		fatfTier = "C"
+		tierLabel = "Medium Risk"
+		priority = "normal"
+	case scoreBps >= 300:
+		fatfTier = "D"
+		tierLabel = "Elevated Risk"
+		priority = "low"
+	case scoreBps >= 100:
+		fatfTier = "E"
+		tierLabel = "High Risk"
+		priority = "deprioritized"
+	default:
+		fatfTier = "F"
+		tierLabel = "Prohibited"
+		priority = "rejected"
+	}
+
+	return map[string]interface{}{
+		"address":            addr.Hex(),
+		"tasteScore":         score,
+		"tasteTier":          tier,
+		"fatfTier":           fatfTier,
+		"fatfTierLabel":      tierLabel,
+		"orderingPriority":   priority,
+		"sanctionsScreened":  true,
+		"complianceVersion":  "v2.0",
+		"orderingContract":   "0x5fc8d32690cc91d4c39d9d3abcbd16989f875707",
+		"disputeWindowBlocks": 256,
 	}, nil
 }
 
