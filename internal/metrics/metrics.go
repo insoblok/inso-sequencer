@@ -55,6 +55,24 @@ type Metrics struct {
 	ReceiptsGenerated atomic.Uint64
 	ReceiptsStored    atomic.Uint64
 
+	// ── Phase 5 Metrics ──
+
+	// AI Score Oracle
+	TasteScoreLookups  atomic.Uint64  // total on-chain score lookups
+	TasteScoreAverage  atomic.Int64   // avg score × 10000 (basis points)
+
+	// Ordering Proofs
+	OrderingProofsGenerated atomic.Uint64
+	OrderingProofsVerified  atomic.Uint64
+
+	// Data Availability
+	DABlobsPublished   atomic.Uint64
+	DABlobBytesTotal   atomic.Uint64
+
+	// Compliance
+	ComplianceScreens  atomic.Uint64
+	ComplianceFlagged  atomic.Uint64
+
 	logger log.Logger
 }
 
@@ -183,4 +201,40 @@ func (m *Metrics) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, "# HELP inso_sequencer_receipts_stored Total compute receipts in store\n")
 	fmt.Fprintf(w, "# TYPE inso_sequencer_receipts_stored gauge\n")
 	fmt.Fprintf(w, "inso_sequencer_receipts_stored %d\n\n", m.ReceiptsStored.Load())
+
+	// ── Phase 5: AI TasteScore ──
+	fmt.Fprintf(w, "# HELP inso_tastescore_lookups_total Total on-chain TasteScore lookups\n")
+	fmt.Fprintf(w, "# TYPE inso_tastescore_lookups_total counter\n")
+	fmt.Fprintf(w, "inso_tastescore_lookups_total %d\n\n", m.TasteScoreLookups.Load())
+
+	fmt.Fprintf(w, "# HELP inso_tastescore_average Average TasteScore (x10000 for precision)\n")
+	fmt.Fprintf(w, "# TYPE inso_tastescore_average gauge\n")
+	fmt.Fprintf(w, "inso_tastescore_average %d\n\n", m.TasteScoreAverage.Load())
+
+	// ── Phase 5: Ordering Proofs ──
+	fmt.Fprintf(w, "# HELP inso_ordering_proofs_generated_total Ordering proofs generated\n")
+	fmt.Fprintf(w, "# TYPE inso_ordering_proofs_generated_total counter\n")
+	fmt.Fprintf(w, "inso_ordering_proofs_generated_total %d\n\n", m.OrderingProofsGenerated.Load())
+
+	fmt.Fprintf(w, "# HELP inso_ordering_proofs_verified_total Ordering proofs verified\n")
+	fmt.Fprintf(w, "# TYPE inso_ordering_proofs_verified_total counter\n")
+	fmt.Fprintf(w, "inso_ordering_proofs_verified_total %d\n\n", m.OrderingProofsVerified.Load())
+
+	// ── Phase 5: Data Availability ──
+	fmt.Fprintf(w, "# HELP inso_da_blobs_published_total DA blobs published\n")
+	fmt.Fprintf(w, "# TYPE inso_da_blobs_published_total counter\n")
+	fmt.Fprintf(w, "inso_da_blobs_published_total %d\n\n", m.DABlobsPublished.Load())
+
+	fmt.Fprintf(w, "# HELP inso_da_blob_bytes_total Total DA blob bytes stored\n")
+	fmt.Fprintf(w, "# TYPE inso_da_blob_bytes_total counter\n")
+	fmt.Fprintf(w, "inso_da_blob_bytes_total %d\n\n", m.DABlobBytesTotal.Load())
+
+	// ── Phase 5: Compliance ──
+	fmt.Fprintf(w, "# HELP inso_compliance_screens_total Compliance screens performed\n")
+	fmt.Fprintf(w, "# TYPE inso_compliance_screens_total counter\n")
+	fmt.Fprintf(w, "inso_compliance_screens_total %d\n\n", m.ComplianceScreens.Load())
+
+	fmt.Fprintf(w, "# HELP inso_compliance_flagged_total Addresses flagged by compliance\n")
+	fmt.Fprintf(w, "# TYPE inso_compliance_flagged_total counter\n")
+	fmt.Fprintf(w, "inso_compliance_flagged_total %d\n\n", m.ComplianceFlagged.Load())
 }
